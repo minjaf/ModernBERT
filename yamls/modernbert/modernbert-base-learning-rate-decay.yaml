@@ -1,23 +1,24 @@
 data_local: data_folder
 data_remote: # If blank, files must be present in data_local
 
-max_seq_len: 1024
+pretrain_data_local: pretrain_data_folder # set this to use pretraining data for validation metrics
+pretrain_data_remote: # If blank, files must be present in pretrain_data_local
+
+max_seq_len: 8192
 tokenizer_name: answerdotai/ModernBERT-base
 mlm_probability: 0.3 # FlexBERT should use 30% masking for optimal performance
 count_padding_tokens: false
 
 # Run Name
-run_name: modernbert-base
+run_name: modernbert-base-learning-rate-decay
+context_extension_run_name: modernbert-base-context-extension
 
 # Model
 model:
   name: flex_bert
-  pretrained_model_name: bert-base-uncased
+  pretrained_model_name: bert-base-uncased # has to be set to bert-base-uncased legacy reasons
   tokenizer_name: ${tokenizer_name}
-  disable_train_metrics: true
-  # FlexBERT 'base' generally uses the default architecture values from the Hugging Face BertConfig object
-  # Note: if using the pretrained_checkpoint argument to create a model from an existing checkpoint, make sure
-  # the model_config settings match the architecture of the existing model
+  disable_train_metrics: true # save some time by not computing metrics on the training set
   model_config:
     vocab_size: 50368
     init_method: full_megatron
@@ -52,9 +53,11 @@ model:
     activation_function: gelu # better safe than sorry
     padding: unpadded
     rotary_emb_dim: null
-    rotary_emb_base: 10000.0
+    rotary_emb_base: 160000.0
     rotary_emb_scale_base: null
     rotary_emb_interleaved: false
+    local_attn_rotary_emb_base: 10000.0
+    local_attn_rotary_emb_dim: null
     allow_embedding_resizing: true
     sliding_window: 128
     global_attn_every_n_layers: 3
@@ -68,24 +71,22 @@ train_loader:
   dataset:
     local: ${data_local}
     remote: ${data_remote}
-    split: train
+    split:
     tokenizer_name: ${tokenizer_name}
     max_seq_len: ${max_seq_len}
     shuffle: true
     mlm_probability: ${mlm_probability}
     streaming: false
+    shuffle_seed: 2998
   drop_last: true
   num_workers: 6
   sequence_packing: true
-  batch_size_warmup_min_size: ${device_train_microbatch_size}
-  batch_size_warmup_tokens: 50_000_000_000tok
-
 
 eval_loader:
   name: text
   dataset:
-    local: ${data_local}
-    remote: ${data_remote}
+    local: ${pretrain_data_local}
+    remote: ${pretrain_data_remote}
     split: validation
     tokenizer_name: ${tokenizer_name}
     max_seq_len: ${max_seq_len}
@@ -99,14 +100,14 @@ eval_loader:
 
 # Optimization
 scheduler:
-  name: warmup_stable_decay
-  t_warmup: 3_000_000_000tok
-  alpha_f: 0.00 # Linearly decay to 0.02x the full LR by the end of the training duration
-  t_decay: 0tok
+  name: one_minus_sqrt
+  alpha_f: 0.001
+  t_decay: ${max_duration}
+  t_max: ${max_duration}
 
 optimizer:
   name: decoupled_stableadamw
-  lr: 8e-4 # Peak learning rate
+  lr: 3e-4 # Peak learning rate
   betas:
   - 0.9
   - 0.98
@@ -115,42 +116,45 @@ optimizer:
   filter_bias_norm_wd: true # If True, doesn't apply weight decay to norm layers and biases
   log_grad_norm: true
 
-max_duration: 1_719_000_000_000tok
-eval_interval: 4000ba
-global_train_batch_size: 4608
+max_duration: 50_000_000_000tok
+eval_interval: 1000ba
+global_train_batch_size: 576
 global_eval_batch_size: 1024
 
 # System
 seed: 17
 device_eval_batch_size: 128
-device_train_microbatch_size: 96
+device_train_microbatch_size: 12
 precision: amp_bf16
 
 # Logging
 progress_bar: false
 log_to_console: true
-console_log_interval: 100ba
+console_log_interval: 500ba
 
 callbacks:
   speed_monitor:
-    window_size: 100
+    window_size: 50
   lr_monitor: {}
   scheduled_gc: {}
   log_grad_norm:
-    batch_log_interval: 100
+    batch_log_interval: 10
   packing_efficiency:
-    log_interval: 100
+    log_interval: 10
 
 # W&B logging
 # loggers:
 #   wandb:
-#     project: 
-#     entity: 
+#     project:
+#     entity:
 
-# Checkpoint to local filesystem or remote object store
-save_interval: 4000ba
+save_interval: 1000ba
 save_num_checkpoints_to_keep: -1  # Important, this cleans up checkpoints saved to DISK
 save_folder: checkpoints/{run_name}
 
 # Load from local filesystem or remote object store to
-# load_path: null
+load_path: checkpoints/{context_extension_run_name}/latest-rank0.pt
+
+autoresume: false
+reset_time: true # restarts the scheduler, dataloaders, etc from step zero
+restart_override: true # resets optimizer hyperparameters (LR, WD, etc), LR Scheduler, and training microbatch size from the checkpoint's values
