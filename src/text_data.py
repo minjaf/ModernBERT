@@ -12,6 +12,7 @@
 import logging
 import math
 import os
+import random
 import sys
 import json
 from itertools import islice
@@ -22,7 +23,7 @@ import torch
 import transformers
 from omegaconf import DictConfig
 from omegaconf import OmegaConf as om
-from streaming import Stream, StreamingDataset
+from streaming import Stream, StreamingDataset, StreamingDataLoader
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
@@ -32,10 +33,12 @@ from composer.utils import dist
 
 from transformers.tokenization_utils_base import BatchEncoding
 
+from Bio.Seq import Seq
+
 # Add src folder root to path to allow us to use relative imports regardless of what directory the script is run from
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 
-from src.sequence_packer import BufferedIterable, GreedyBestFitSequencePacker
+from sequence_packer import BufferedIterable, GreedyBestFitSequencePacker
 
 Tokenizer = Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
 
@@ -142,6 +145,7 @@ class StreamingTextDataset(StreamingDataset):
         self,
         tokenizer: Tokenizer,
         max_seq_len: int,
+        pad_sequences: bool,
         streams: Optional[Sequence[Stream]] = None,
         remote: Optional[str] = None,
         local: Optional[str] = None,
@@ -200,6 +204,7 @@ class StreamingTextDataset(StreamingDataset):
         )
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
+        self.pad_sequences = pad_sequences
 
     # How to tokenize a text sample to a token sample
     def _tokenize(self, text_sample):
@@ -207,9 +212,16 @@ class StreamingTextDataset(StreamingDataset):
             # Some tokenizers (e.g. GPT2 tokenizer) have no padding token which causes bugs
             raise RuntimeError("If tokenizing on-the-fly, tokenizer must have a pad_token_id")
 
-        return self.tokenizer(text_sample["text"], truncation=True, padding="max_length", max_length=self.max_seq_len)
+        return self.tokenizer(text_sample["text"],
+                              truncation=True,
+                              padding="max_length" if self.pad_sequences else False,
+                              max_length=self.max_seq_len)
 
     def _read_binary_tokenized_sample(self, sample: BatchEncoding):
+        if not self.pad_sequences:
+            raise RuntimeError(
+                "packing with pre-tokenized data is not implemented, make sure that there is no paddings.")
+
         seq_len = sample["len"] if "len" in sample else len(sample["input_ids"])
 
         input_ids = np.frombuffer(sample["input_ids"], dtype=np.int64).copy()
@@ -293,6 +305,7 @@ class ConcatenatedSequenceCollatorWrapper:
 def build_streaming_dataset(
     cfg: DictConfig,
     tokenizer: Tokenizer,
+    pad_sequences: bool,
     device_batch_size: int,
 ):
     # build streams
@@ -317,9 +330,11 @@ def build_streaming_dataset(
             )
 
     # build dataset potentially with streams
+    # todo: make StreamingGenomeDataset similar to NoStreamingGenomeDataset
     dataset = StreamingTextDataset(
         tokenizer=tokenizer,
         max_seq_len=cfg.dataset.max_seq_len,
+        pad_sequences=pad_sequences,
         streams=streams,
         remote=cfg.dataset.get("remote", None),
         local=cfg.dataset.get("local", None),
@@ -346,13 +361,25 @@ def build_no_streaming_dataset(
     tokenizer: Tokenizer,
     pad_sequences: bool = True,
 ):
-    return NoStreamingDataset(
-        tokenizer=tokenizer,
-        local=cfg.dataset.get("local", None),
-        split=cfg.dataset.get("split", None),
-        max_seq_len=cfg.dataset.max_seq_len,
-        pad_sequences=pad_sequences,
-    )
+    if cfg.dataset.get('data_type', None) == 'genome':
+        return NoStreamingGenomeDataset(
+            tokenizer=tokenizer,
+            local=cfg.dataset.get("local", None),
+            split=cfg.dataset.get("split", None),
+            max_seq_len=cfg.dataset.max_seq_len,
+            pad_sequences=pad_sequences,
+            augment_rc=cfg.dataset.get("augment_rc", False),
+            sample_chunk=cfg.dataset.get("sample_chunk", False),
+            min_seq_len=cfg.dataset.get("min_seq_len", 10)
+        )
+    else:
+        return NoStreamingDataset(
+            tokenizer=tokenizer,
+            local=cfg.dataset.get("local", None),
+            split=cfg.dataset.get("split", None),
+            max_seq_len=cfg.dataset.max_seq_len,
+            pad_sequences=pad_sequences,
+        )
 
 
 def build_text_dataloader(
@@ -368,16 +395,15 @@ def build_text_dataloader(
             + "concatenate, use the --concat_tokens "
             + "argument when creating your MDS dataset with convert_dataset.py"
         )
-
+    use_sequence_packing = cfg.get("sequence_packing", False)
     if cfg.dataset.get("streaming", True):
-        dataset = build_streaming_dataset(cfg, tokenizer, device_batch_size)
+        dataset = build_streaming_dataset(cfg, tokenizer, pad_sequences=not use_sequence_packing,
+                                          device_batch_size=device_batch_size)
         sampler = None
     else:
         assert cfg.dataset.get("local", None) is not None, "Local path must be provided when not using streaming"
         # sequence packing should never use padded sequences, regular dataloaders may if tokenizing on the fly
-        dataset = build_no_streaming_dataset(
-            cfg, tokenizer=tokenizer, pad_sequences=not cfg.get("sequence_packing", False)
-        )
+        dataset = build_no_streaming_dataset(cfg, tokenizer=tokenizer, pad_sequences=use_sequence_packing)
         sampler = DistributedSamplerPCG64DXSM(
             dataset,
             num_replicas=dist.get_world_size(),
@@ -389,19 +415,39 @@ def build_text_dataloader(
 
     mlm_probability = cfg.dataset.get("mlm_probability", None)
     # only use sequence packing if using the no_streaming_dataset
-    if not cfg.dataset.get("streaming", True) and cfg.get("sequence_packing", False):
-        dataloader = DataLoader(
-            dataset,
-            collate_fn=lambda x: x,
-            batch_size=device_batch_size,
-            drop_last=False,
-            num_workers=cfg.num_workers,
-            pin_memory=cfg.get("pin_memory", True),
-            prefetch_factor=cfg.get("prefetch_factor", 2),
-            persistent_workers=cfg.get("persistent_workers", True),
-            timeout=cfg.get("timeout", 0),
-            sampler=sampler,
-        )
+    # if not cfg.dataset.get("streaming", True) and cfg.get("sequence_packing", False):
+    if use_sequence_packing:
+        if cfg.dataset.get("streaming", True):
+            # streaming dataset already handles splitting and shuffling data for each rank
+            dataloader = DataLoader(
+                dataset,
+                collate_fn=lambda x: x,
+                batch_size=device_batch_size,
+                drop_last=False,
+                num_workers=cfg.num_workers,
+                pin_memory=cfg.get("pin_memory", True),
+                prefetch_factor=cfg.get("prefetch_factor", 2),
+                persistent_workers=cfg.get("persistent_workers", True),
+                timeout=cfg.get("timeout", 0),
+                sampler=sampler,
+            )
+        else:
+            dataloader = DataLoader(
+                dataset,
+                collate_fn=lambda x: x,
+                batch_size=device_batch_size,
+                drop_last=False,
+                num_workers=cfg.num_workers,
+                pin_memory=cfg.get("pin_memory", True),
+                prefetch_factor=cfg.get("prefetch_factor", 2),
+                persistent_workers=cfg.get("persistent_workers", True),
+                timeout=cfg.get("timeout", 0),
+                sampler=sampler,
+            )
+        # todo: make GreedyBestFitSequencePacker and BufferedIterable inherit from dataloaders
+        # to save state of StreamDataset to ckpt['state']['dataset_state']
+        # check how dataset is extracted from dataloader in composer.core.state:_dataset_of
+        # another possible way is to manually set state of dataset when resuming training
         sequence_packer = GreedyBestFitSequencePacker.from_composer(
             dataloader,
             batch_size=device_batch_size,
@@ -416,7 +462,8 @@ def build_text_dataloader(
             batch_size_warmup_tokens=cfg.get("batch_size_warmup_tokens", None),
             world_size=dist.get_world_size(),
         )
-        return BufferedIterable(sequence_packer, buffer_size=cfg.get("packing_prefetch_factor", 5))
+        buffered_iterable = BufferedIterable(sequence_packer, buffer_size=cfg.get("packing_prefetch_factor", 5))
+        return buffered_iterable
     else:
         collate_fn = transformers.DataCollatorForLanguageModeling(
             tokenizer=dataset.tokenizer, mlm=mlm_probability is not None, mlm_probability=mlm_probability
@@ -515,6 +562,55 @@ class NoStreamingDataset(Dataset):
         return self.len
 
 
+class NoStreamingGenomeDataset(NoStreamingDataset):
+
+    def __init__(
+        self,
+        local: str,
+        split: Optional[str],
+        max_seq_len: int,
+        tokenizer: Optional[Tokenizer] = None,
+        pad_sequences: bool = True,
+        augment_rc: bool = False,
+        sample_chunk: bool = False,
+        min_seq_len: int = 10,
+    ) -> None:
+        super().__init__(local, split, max_seq_len, tokenizer, pad_sequences)
+        # todo: add seed and check that its ok for multiple workers
+        self.augment_rc = augment_rc
+        self.sample_chunk = sample_chunk
+        self.min_seq_len = min_seq_len
+
+    def _tokenize(self, text_sample):
+        assert self.tokenizer is not None, "Tokenizer required if data is not pretokenized"
+        if self.tokenizer._pad_token is None:
+            # Some tokenizers (e.g. GPT2 tokenizer) have no padding token which causes bugs
+            raise RuntimeError("If tokenizing on-the-fly, tokenizer must have a pad_token_id")
+
+        text = text_sample['text']
+
+        st_index = 0
+        max_seq_len = self.max_seq_len
+        if self.sample_chunk:
+            # todo: do we really want uniform length sampling here?
+            max_seq_len = random.randint(self.min_seq_len, self.max_seq_len)
+            # choose start index somewhere in the first half
+            st_index = random.randint(0, len(text) // 2)
+
+        text = text[st_index:]
+        text = text[:max_seq_len * 10]  # cut to make tokenization faster if text is too long
+
+        if self.augment_rc and random.random() > 0.5:
+            text = str(Seq(text).reverse_complement())
+
+        return self.tokenizer(
+            text,
+            truncation=True,
+            padding="max_length" if self.pad_sequences else False,
+            max_length=max_seq_len,
+        )
+
+
 # Helpful to test if your dataloader is working locally
 # Run `python data.py  --local_path [local] [--remote_path remote, optional]` and verify that batches are printed out
 if __name__ == "__main__":
@@ -552,13 +648,14 @@ if __name__ == "__main__":
     }
     cfg = om.create(cfg)
     device_batch_size = 2
+    device_microbatch_size = 2
 
     tokenizer_cfg = {"name": args.tokenizer, "kwargs": {}}
     tokenizer_cfg["kwargs"] = {"model_max_length": args.max_seq_len}
     tokenizer_cfg = om.create(tokenizer_cfg)
     tokenizer = build_tokenizer(tokenizer_cfg)
 
-    loader = build_text_dataloader(cfg, tokenizer, device_batch_size)
+    loader = build_text_dataloader(cfg, tokenizer, device_batch_size, device_microbatch_size)
     tokenizer = loader.dataset.tokenizer  # type: ignore
     for batch_ix, batch in enumerate(islice(loader, 5)):
         print("\n")
