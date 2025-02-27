@@ -432,6 +432,12 @@ def main(cfg: DictConfig, return_trainer: bool = False, do_train: bool = True) -
     if cfg.get("run_name") is None:
         cfg.run_name = os.environ.get("COMPOSER_RUN_NAME", "bert")
 
+    # save cfg file with filled values
+    if dist.get_global_rank() == 0 and cfg.get('save_folder', None):
+        save_folder = Path(cfg.save_folder.format(**cfg))
+        save_folder.mkdir(parents=True, exist_ok=False)  # to ensure that we do not overwrite existing folder
+        om.save(cfg, (save_folder / 'cfg.yaml').open('w'))
+
     # Build the Trainer
     trainer = Trainer(
         run_name=cfg.run_name,
