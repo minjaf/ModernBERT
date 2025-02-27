@@ -19,6 +19,7 @@ from src.bert_layers.model import init_mlm_model_from_pretrained
 # Add folder root to path to allow us to use relative imports regardless of what directory the script is run from
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 
+import streaming
 from composer import Evaluator, Trainer, algorithms
 from composer.callbacks import LRMonitor, MemoryMonitor, OptimizerMonitor, RuntimeEstimator, SpeedMonitor
 from composer.core import DataSpec
@@ -525,4 +526,7 @@ if __name__ == "__main__":
     cli_cfg = om.from_cli(args_list)
     cfg = om.merge(default_cfg, yaml_cfg, cli_cfg)
     cfg = cast(DictConfig, cfg)  # for type checking
+    # https://github.com/mosaicml/streaming/issues/824
+    # streaming 0.9.0
+    streaming.base.util.clean_stale_shared_memory()
     main(cfg)
