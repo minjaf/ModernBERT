@@ -503,6 +503,8 @@ dependencies:
   - zipp=3.20.0
   - zlib=1.3.1
   - zstandard=0.23.0
+  - biopython=1.83
+  - tensorboard=2.15.2
   - pip:
       - mosaicml==0.24.1
       - mosaicml-cli==0.6.41
