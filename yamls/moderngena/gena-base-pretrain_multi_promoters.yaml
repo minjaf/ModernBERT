@@ -1,5 +1,5 @@
 # data_local: ./human_t2t_1k
-data_local: ./data/promoters_mds/valid_small
+data_local: ./data/promoters_mds/valid
 data_remote: # If blank, files must be present in data_local
 
 max_seq_len: 1024
