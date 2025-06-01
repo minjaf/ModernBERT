@@ -171,3 +171,4 @@ wandb/
 # data
 runs/*
 data/*
+*.mds
