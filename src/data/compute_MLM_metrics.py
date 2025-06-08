@@ -1,6 +1,6 @@
 # Run like this:
 # conda activate bert24
-# python3 compute_MLM_metrics.py --model_path ~/DNALM/ModernBERT/runs/moderngena-base-pretrain-promoters_test/ --data_dir /mnt/nfs_dna/minja/DNALM/promoter_pretrain/ --split valid --max_seq_len 1024 --output_file tmp.json
+# python3 compute_MLM_metrics.py --model_path ~/DNALM/ModernBERT/runs//DNALM/ModernBERT/runs/moderngena-base-pretrain-promoters_multi/ --data_dir /mnt/nfs_dna/minja/DNALM/promoter_pretrain/ --split valid --max_seq_len 1024 --output_file tmp.json
 
 import os
 import argparse
@@ -15,6 +15,7 @@ import random
 from typing import Optional, Union, Dict, Any
 from Bio.Seq import Seq
 import datetime
+import logging
 
 # Add ModernBERT to path
 import sys
@@ -26,6 +27,9 @@ from src import mosaic_bert as mosaic_bert_module
 from src.bert_layers.model import init_mlm_model_from_pretrained
 from src.bert_layers.configuration_bert import FlexBertConfig
 from composer.utils.checkpoint import _ensure_valid_checkpoint
+
+# Initialize global logger
+logger = logging.getLogger(__name__)
 
 Tokenizer = Union[AutoTokenizer, Any]
 
@@ -61,6 +65,8 @@ class NoStreamingGenomeDatasetAndDataloader(NoStreamingDataset):
 		# raise Exception("Stop here")
 
 		text = text_sample['text']
+		logger.debug(f"text:\n {text[:250]}")
+		# raise Exception("Stop here")
 
 		if self.sample_chunk:
 			raise NotImplementedError("Chunk sampling is not implemented for sequence metrics")
@@ -73,11 +79,14 @@ class NoStreamingGenomeDatasetAndDataloader(NoStreamingDataset):
 			text,
 			truncation=False,
 			padding=False,  # We'll handle padding ourselves
-			return_offsets_mapping=True
+			return_offsets_mapping=True,
+			add_special_tokens=False
 		)
 		
 		# Split long sequences into chunks
 		input_ids = tokenized['input_ids']
+
+		logger.debug(f"tokenized:\n {self.tokenizer.decode(input_ids[:30])}")
 		attention_mask = tokenized['attention_mask']
 		offset_mapping = tokenized['offset_mapping']
 		
@@ -132,6 +141,15 @@ class NoStreamingGenomeDatasetAndDataloader(NoStreamingDataset):
 		return self.len
 		
 
+def get_logger(logLevel=logging.INFO):
+	global logger
+	logger.setLevel(logLevel)
+	handler = logging.StreamHandler()
+	formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+	handler.setFormatter(formatter)
+	logger.addHandler(handler)
+	return logger
+
 def build_model(cfg: DictConfig):
 	if cfg.name == "hf_bert":
 		return hf_bert_module.create_hf_bert_mlm(
@@ -175,7 +193,7 @@ def load_model_and_tokenizer(model_path):
 	# Load checkpoint
 	# checkpoint_filepath = os.path.join(model_path, "ep11-ba68300-rank0.pt")
 	checkpoint_filepath = os.path.join(model_path, "latest-rank0.pt")	
-	print(f"Loading checkpoint from {checkpoint_filepath}")
+	logger.info(f"Loading checkpoint from {checkpoint_filepath}")
 	state = torch.load(_ensure_valid_checkpoint(checkpoint_filepath), map_location="cpu")
 	state_dict = state.get("state", {})
 	model_state = state_dict.get("model", {})
@@ -276,21 +294,32 @@ def process_sequence_chunk(model, tokenizer, input_ids, attention_mask, offset_m
 	# Initialize probability array for the chunk
 	# Each position will store the probability of the ground truth token
 	chunk_probs = np.full(chunk_length, np.nan)
+	# chunks_nucleotides_pred = [""]*seq_length
+	# chunks_nucleotides_true = [""]*seq_length
 	
 	# Process each offset pattern
 	all_masked_positions = [] # for checking if all positions were masked
-	print (f"{datetime.datetime.now()} Processing chunk {file_id} {line_id} {chunk_start} {chunk_end}")
+	logger.debug(f"Processing chunk {file_id} {line_id} {chunk_start} {chunk_end}")
 	for offset in range(n_offset_patterns):
-		print (f"{datetime.datetime.now()} Processing offset {offset}")
+		logger.debug(f"Processing offset {offset}")
 		# Store ground truth tokens for masked positions
 		ground_truths = []
 		mask_positions = []
 		
 		# Get positions to mask for this offset (skip CLS token)
+		# positions are in withCLS coordinate system (same as input_ids)
 		positions = [p + 1 for p in get_mask_positions(seq_length, n_tokens_to_mask, offset)]
 		
 		# Store ground truth tokens
+		# _ = input_ids.detach().cpu().numpy()
+		# logger.debug(f"{_[:10]}")
+		# for pos in positions:
+		# 	if input_ids[pos].item() == 1:
+		# 		logger.debug(f"input_ids[pos]==1 in positions: {pos}")
 		ground_truths.extend([input_ids[pos].item() for pos in positions])
+		# assert not 1 in ground_truths, "1 is in ground_truths"
+		# raise Exception("Stop here")
+		logger.debug(f"ground_truths:\n {tokenizer.decode(ground_truths)[:250]}")
 		mask_positions.extend(positions)
 		all_masked_positions.extend([p - 1 for p in positions])  # Convert back to non-special token positions
 		
@@ -304,25 +333,25 @@ def process_sequence_chunk(model, tokenizer, input_ids, attention_mask, offset_m
 		}
 
 		# Get model predictions
-		print (f"{datetime.datetime.now()} Getting model predictions")
+		logger.debug("Getting model predictions")
 		with torch.no_grad():
 			outputs = model(inputs)
 			logits = outputs.logits.reshape(inputs['input_ids'].shape[0],
 										  inputs['input_ids'].shape[1],
 										  -1)
-			print (f"{datetime.datetime.now()} Got model predictions")
+			logger.debug("Got model predictions")
 			# Get probabilities for masked positions
 			# probs = torch.softmax(logits[0, positions], dim=1)
 			probs = torch.argmax(logits[0, positions], dim=1)
-			print (f"{datetime.datetime.now()} Done softmax")
+			logger.debug("Done softmax")
 			probs = probs.cpu().numpy()
-			print (f"{datetime.datetime.now()} Moved to cpu")
+			logger.debug("Moved to cpu")
 
 		# print (probs.shape)
 		# raise Exception("Stop here")
 		
 		# Update chunk_probs with ground truth token probabilities
-		print (f"{datetime.datetime.now()} Filling chunk_probs")
+		logger.debug("Filling chunk_probs")
 
 		for i, pos in enumerate(positions):
 			# Get character position for this token
@@ -334,8 +363,15 @@ def process_sequence_chunk(model, tokenizer, input_ids, attention_mask, offset_m
 
 			# Update all positions in the token's span
 			chunk_probs[start - chunk_start:end - chunk_start] = gt_prob
-		print (f"{datetime.datetime.now()} Filled chunk_probs")
-	print (f"{datetime.datetime.now()} Saving results")
+			# save predicted nucleotides
+			assert end-start > 0, f"end-start={end-start} for pos={pos}, ground_truths[i]={ground_truths[i]}, decoded: {tokenizer.decode(ground_truths[i])}"
+			# chunks_nucleotides_pred[pos - 1] = tokenizer.decode(probs[i])
+			# chunks_nucleotides_true[pos - 1] = tokenizer.decode(ground_truths[i])	
+			# print (tokenizer.decode(probs[i]), tokenizer.decode(ground_truths[i]))
+		logger.debug("Filled chunk_probs")
+	logger.debug("Saving results")
+	# assert all([len(s)>0 for s in chunks_nucleotides_true]), "Some nucleotides are empty"
+	# raise Exception("Stop here")
 	# Save results
 	output_file.write(json.dumps({
 		"file_id": file_id,
@@ -344,7 +380,10 @@ def process_sequence_chunk(model, tokenizer, input_ids, attention_mask, offset_m
 		"chunk_end": chunk_end,
 		"probabilities": chunk_probs.tolist(),
 	}) + "\n")
-	print (f"{datetime.datetime.now()} Saved results")
+	# "nucleotides_pred": chunks_nucleotides_pred,
+	# "nucleotides_true": chunks_nucleotides_true,
+
+	logger.debug("Saved results")
 	# Verify all positions were masked
 	all_masked_positions = np.array(all_masked_positions)
 	assert len(np.unique(all_masked_positions)) == seq_length, "Mask positions do not cover all positions"
@@ -358,15 +397,20 @@ def main():
 	# parser.add_argument("--batch_size", type=int, default=16, help="Batch size for processing")
 	parser.add_argument("--mlm_probability", type=float, default=0.3, help="Probability of masking tokens")
 	parser.add_argument("--output_file", type=str, required=True, help="Output file path")
+	parser.add_argument("--log_level", type=str, default="INFO", help="Logging level")
 	args = parser.parse_args()
 
+	# Set logging level
+	log_level = getattr(logging, args.log_level.upper())
+	logger = get_logger(log_level)
+
 	# Load model and tokenizer
-	print (f"{datetime.datetime.now()} Loading model and tokenizer from {args.model_path}")
+	logger.info(f"Loading model and tokenizer from {args.model_path}")
 	model, tokenizer = load_model_and_tokenizer(args.model_path)
 	# model, tokenizer =  None, AutoTokenizer.from_pretrained("AIRI-Institute/gena-lm-bert-base-t2t")
 
 	
-	print (f"{datetime.datetime.now()} Creating dataset")	
+	logger.info("Creating dataset")	
 	# Create dataset
 	batched_dataset = NoStreamingGenomeDatasetAndDataloader(
 		local=args.data_dir,
@@ -378,16 +422,19 @@ def main():
 	
 	# Process sequences
 	processed = 0
+	N_to_process = 10
+	# create progress bar
+	progress_bar = tqdm(total=N_to_process, desc="Processing batches")
 	with open(args.output_file, 'w') as f:
-		batch_id = 465_000 # approximately here starts human data; remove this line to process all data
+		batch_id = 468_000 # approximately here starts human data; remove this line to process all data
 		while batch_id < len(batched_dataset):
 			batch = batched_dataset[batch_id]
-			print (f"{datetime.datetime.now()} Processing batch {processed}")
+			logger.debug(f"Processing batch {batch_id}")
 			if not batch[0]['file_id'].startswith('GCF_000001405'): # batch_id is 470000
-				print (batch[0]['file_id'])
-				batch_id += 1000
+				logger.debug(f"Skipping batch {batch[0]['file_id']}")
+				batch_id += 100
 				continue
-			print (batch_id)
+			logger.debug(f"Processing batch {batch_id}")
 			process_batch(
 				model, 
 				tokenizer,
@@ -396,9 +443,10 @@ def main():
 				f,
 			)
 			batch_id += 1
-			print (f"{datetime.datetime.now()} Done processing batch {processed}")			
+			progress_bar.update(1)
+			logger.debug(f"Done processing batch {processed}")			
 			processed += 1
-			if processed > 10:
+			if processed > N_to_process:
 				break
 
 if __name__ == "__main__":
