@@ -1,6 +1,6 @@
 # Run like this:
 # conda activate bert24
-# python3 compute_MLM_metrics.py --model_path ~/DNALM/ModernBERT/runs//DNALM/ModernBERT/runs/moderngena-base-pretrain-promoters_multi/ --data_dir /mnt/nfs_dna/minja/DNALM/promoter_pretrain/ --split valid --max_seq_len 1024 --output_file tmp.json
+# python3 compute_MLM_metrics.py --model_path ~/DNALM/ModernBERT/runs/moderngena-base-pretrain-promoters_multi/ --data_dir /mnt/nfs_dna/minja/DNALM/promoter_pretrain/ --split valid --max_seq_len 1024 --output_file human.100samples.json # --log_level DEBUG
 
 import os
 import argparse
@@ -12,6 +12,7 @@ import json
 from tqdm import tqdm
 import numpy as np
 import random
+random.seed(111)
 from typing import Optional, Union, Dict, Any
 from Bio.Seq import Seq
 import datetime
@@ -206,36 +207,6 @@ def load_model_and_tokenizer(model_path):
 	
 	return model, tokenizer
 
-# def calculate_token_metrics(model, tokenizer, inputs, ground_truths):
-# 	if torch.cuda.is_available():
-# 		inputs = {k: v.cuda() for k, v in inputs.items()}
-	
-# 	with torch.no_grad():
-# 		outputs = model(inputs)
-# 		logits = outputs.logits.reshape(inputs['input_ids'].shape[0],
-# 									  inputs['input_ids'].shape[1],
-# 									  -1)
-
-# 	# Find positions of [MASK] tokens
-# 	mask_positions = (inputs['input_ids'] == tokenizer.mask_token_id).nonzero()
-# 	batch_indices = mask_positions[:, 0]
-# 	token_positions = mask_positions[:, 1]
-
-# 	# Get probabilities for masked positions
-# 	probs = torch.softmax(logits[batch_indices, token_positions], dim=1).cpu().numpy()
-	
-# 	# Get highest probability tokens
-# 	highest_prob_token_ids = np.argmax(probs, axis=1)
-	
-# 	# Check if predictions are correct
-# 	correct = (highest_prob_token_ids == np.array(ground_truths)).astype(int)
-	
-# 	return {
-# 		"is_correct": correct,
-# 		"highest_prob_token": tokenizer.convert_ids_to_tokens(highest_prob_token_ids),
-# 		"mask_positions": token_positions.cpu().numpy()
-# 	}
-
 def get_mask_positions(seq_length, n_tokens_to_mask, offset):
 	"""Generate mask positions with given offset.
 	For example, if seq_length=10, n_tokens_to_mask=3:
@@ -258,7 +229,7 @@ def process_batch(model, tokenizer, batch, mlm_probability, output_file):
 	# Process each sequence in the batch
 	for i in range(len(batch)):
 		# Process sequence
-		process_sequence_chunk(
+		return process_sequence_chunk(
 			model, tokenizer,
 			batch[i]['input_ids'], 
 			batch[i]['attention_mask'], 
@@ -299,6 +270,7 @@ def process_sequence_chunk(model, tokenizer, input_ids, attention_mask, offset_m
 	
 	# Process each offset pattern
 	all_masked_positions = [] # for checking if all positions were masked
+	overall_tokens_accuracy = []
 	logger.debug(f"Processing chunk {file_id} {line_id} {chunk_start} {chunk_end}")
 	for offset in range(n_offset_patterns):
 		logger.debug(f"Processing offset {offset}")
@@ -360,6 +332,7 @@ def process_sequence_chunk(model, tokenizer, input_ids, attention_mask, offset_m
 			# gt_prob = probs[i, ground_truths[i]]
 
 			gt_prob = probs[i]==ground_truths[i]
+			overall_tokens_accuracy.append(gt_prob)
 
 			# Update all positions in the token's span
 			chunk_probs[start - chunk_start:end - chunk_start] = gt_prob
@@ -387,6 +360,10 @@ def process_sequence_chunk(model, tokenizer, input_ids, attention_mask, offset_m
 	# Verify all positions were masked
 	all_masked_positions = np.array(all_masked_positions)
 	assert len(np.unique(all_masked_positions)) == seq_length, "Mask positions do not cover all positions"
+	return {
+		"nucleotide_accuracy": np.mean(chunk_probs),
+		"token_accuracy": np.mean(overall_tokens_accuracy)
+	}
 
 def main():
 	parser = argparse.ArgumentParser()
@@ -422,32 +399,52 @@ def main():
 	
 	# Process sequences
 	processed = 0
-	N_to_process = 10
+	N_to_process = 5000
 	# create progress bar
 	progress_bar = tqdm(total=N_to_process, desc="Processing batches")
+	nucleotide_accuracy = []
+	token_accuracy = []
+	human = False
+	randomize = True
+
+	assert not human or not randomize, "Cannot process human data and randomize at the same time"
+
 	with open(args.output_file, 'w') as f:
-		batch_id = 468_000 # approximately here starts human data; remove this line to process all data
-		while batch_id < len(batched_dataset):
+		if human:
+			batch_id = 468_000 # approximately here starts human data; remove this line to process all data
+		else:
+			batch_id = 0
+
+		if randomize:
+			# sample N_to_process samples from the dataset without replacement
+			batch_ids = random.sample(range(len(batched_dataset)), N_to_process)
+		else:
+			batch_ids = range(batch_id, batch_id + N_to_process)
+
+		for batch_id in batch_ids:
 			batch = batched_dataset[batch_id]
 			logger.debug(f"Processing batch {batch_id}")
-			if not batch[0]['file_id'].startswith('GCF_000001405'): # batch_id is 470000
+			if not batch[0]['file_id'].startswith('GCF_000001405') and human: # batch_id is 470000
 				logger.debug(f"Skipping batch {batch[0]['file_id']}")
-				batch_id += 100
 				continue
 			logger.debug(f"Processing batch {batch_id}")
-			process_batch(
+			results = process_batch(
 				model, 
 				tokenizer,
 				batch,
 				args.mlm_probability,
 				f,
 			)
-			batch_id += 1
+			nucleotide_accuracy.append(results["nucleotide_accuracy"])
+			token_accuracy.append(results["token_accuracy"])
 			progress_bar.update(1)
 			logger.debug(f"Done processing batch {processed}")			
 			processed += 1
 			if processed > N_to_process:
 				break
+	
+	print (f"Nucleotide accuracy: {np.mean(nucleotide_accuracy):.3f}+-{np.std(nucleotide_accuracy):.3f}")
+	print (f"Token accuracy: {np.mean(token_accuracy):.3f}+-{np.std(token_accuracy):.3f}")
 
 if __name__ == "__main__":
 	main() 
