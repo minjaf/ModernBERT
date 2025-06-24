@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# conda activate bert24
+# split="valid"; python promoters2mds.py --json_folder /mnt/nfs_dna/shadskiy/promoters/pretrena/$split/ --out_dir /mnt/nfs_dna/shadskiy/promoters/pretrena/mds_v2/ --split_name $split --overwrite
 
 import argparse
 import json
@@ -18,7 +20,7 @@ def parse_args():
                       help='Output directory for MDS files'
                       )
     parser.add_argument('--split_name', type=str, required=True,
-                      help='Name of the split (e.g., train, valid, test)')
+                      help='Name of the split (e.g., train, valid, test) for output directory')
     parser.add_argument('--n_files', type=int, default=None,
                       help='Number of files to process (for debugging). If None, process all files')
     parser.add_argument('--min_len', type=int, default=1000,
@@ -51,7 +53,7 @@ def process_files(args):
         jsonfiles = jsonfiles[:args.n_files]
 
     # Required keys in JSON files
-    keys = ['text', 'promoter_strand', 'transcript_strand', 'position',
+    keys = ['text', 'sample_strand', 'transcript_strand', 'start', 'end',
             'transcript_ID', 'gene_ID', 'transcript_type', 'chromosome', 'genome']
 
     # Process files
@@ -64,10 +66,10 @@ def process_files(args):
 
     with MDSWriter(columns=columns, out=full_out_dir, size_limit='64mb') as fout:
         for file in tqdm(jsonfiles):
-            with open(os.path.join(args.json_folder, file), 'r') as f:
+            with open(os.path.join(args.json_folder, file + f"/{file}.jsonl"), 'r') as f:
                 for line_id, line in enumerate(f):
                     j = json.loads(line)
-                    assert all(key in j for key in keys)
+                    assert all(key in j for key in keys), f"{[k for k in keys if k not in j]}"
                     text = j['text']
                     assert len(text) == 1, f"Multiple text items for file {file}"
                     text = text[0]
@@ -93,7 +95,7 @@ def process_files(args):
     plt.figure(figsize=(10, 6))
     sns.histplot(chunks_lengths)
     plt.yscale('log')
-    plt.title(f'Distribution of chunk lengths for {args.split_name}')
+    plt.title(f'Distribution of chunk lengths for {args.split_name}\ntot L: {sum(chunks_lengths)} bp, tot N: {len(chunks_lengths)}')
     plt.xlabel('Chunk length')
     plt.ylabel('Count (log scale)')
     plot_path = os.path.join(stats_out_dir, f'{args.split_name}.length_distribution.png')
