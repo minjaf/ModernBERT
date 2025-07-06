@@ -308,7 +308,6 @@ class DataCollatorForLanguageModelingWithMLMProbs(transformers.DataCollatorForLa
             assert torch.all(avg_prob <= 1.0), f"avg_prob {avg_prob} must be less than 1.0"
             assert torch.all(avg_prob > 0.0), f"avg_prob {avg_prob} must be greater than 0.0"
             # Scale the probabilities to maintain the target average
-            print (mask_probs_array.size(), avg_prob.unsqueeze(1).size())
             mask_probs = mask_probs_array * (self.mlm_probability / avg_prob.unsqueeze(1))
             # Clip to ensure probabilities stay in [0, 1] range
             mask_probs = torch.clip(mask_probs, 0.0, 1.0)
@@ -374,9 +373,10 @@ class DataCollatorForLanguageModelingWithMLMProbs(transformers.DataCollatorForLa
         # If special token mask has been preprocessed, pop it from the dict.
         special_tokens_mask = batch.pop("special_tokens_mask", None)
         if self.mlm:
-            if "mask_probs_array" in batch:
+            if "MLM_probs" in batch:
                 batch["input_ids"], batch["labels"] = self.torch_mask_tokens(
-					batch["input_ids"], special_tokens_mask=special_tokens_mask, mask_probs_array=batch["mask_probs_array"]
+					batch["input_ids"], special_tokens_mask=special_tokens_mask, 
+                    mask_probs_array=batch["MLM_probs"]
 				)
             else:
                 batch["input_ids"], batch["labels"] = self.torch_mask_tokens(
@@ -596,7 +596,6 @@ def build_text_dataloader(
         buffered_iterable = BufferedIterable(sequence_packer, buffer_size=cfg.get("packing_prefetch_factor", 5))
         return buffered_iterable
     else:
-        # dataset.tokenizer.model_input_names.append("MLM_probs") # TODO: make something more graceful
         collate_fn = DataCollatorForLanguageModelingWithMLMProbs(
             tokenizer=dataset.tokenizer, mlm=mlm_probability is not None, mlm_probability=mlm_probability
         )
@@ -797,25 +796,34 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
                             f.create_dataset(str(shard_sample_id), data=[np.nan]*len(sample['text']), dtype=self.MLM_PROB_DTYPE)
 
                 # check if we have sample in hdf_file
-                print ("Acquiring mlm probs for ", hdf5_file) # debug
+                # print ("Acquiring mlm probs for ", hdf5_file) # debug
                 with FileLock(hdf5_file+".lock"):
                     with h5py.File(hdf5_file, "a") as f:
                         if str(shard_sample_id) not in f:
-                            print (f"Sample {shard_sample_id} not found in shard_{shard_id}.hdf5") # debug
+                            # print (f"Sample {shard_sample_id} not found in shard_{shard_id}.hdf5") # debug
                             f.create_dataset(str(shard_sample_id), data=[np.nan]*len(sample['text']), dtype=self.MLM_PROB_DTYPE)
 
-                        start_index = result["offsets_mapping_starts"][0]
-                        end_index = result["offsets_mapping_ends"][-1]
+                        start_index = min(result["offsets_mapping_starts"])
+                        end_index = max(result["offsets_mapping_ends"])
+                        assert end_index - start_index <= len(sample['text'])
+                        assert end_index - start_index >= 0
                         mlm_probs = f[str(shard_sample_id)][start_index:end_index]
                         mlm_probs = np.nan_to_num(mlm_probs, nan=1.0, copy=False) # probability=1.0 for unseen positions
                         # mlm_probs are stored in base-pair resolution, so we need to convert them to bpe-token resolution according to offsets_mapping
-                        mlm_probs = [sum(mlm_probs[tok_start:tok_end]) for tok_start,tok_end in zip(result["offsets_mapping_starts"], result["offsets_mapping_ends"])]
-                        assert len(mlm_probs) == len(result["input_ids"]), "MLM probs and input ids have different lengths"
-                        result["MLM_probs"] = mlm_probs
+                        mlm_probs_list = []
+                        for tok_start,tok_end in zip(result["offsets_mapping_starts"], result["offsets_mapping_ends"]):
+                            if tok_end - tok_start == 0: # service tokens and padding
+                                mlm_probs_list.append(0.)
+                            elif tok_end - tok_start > 0:
+                                mlm_probs_list.append(np.mean(mlm_probs[tok_start-start_index:tok_end-start_index]))
+                            else:
+                                raise ValueError(f"tok_end - tok_start = {tok_end - tok_start} is negative")
+                        assert len(mlm_probs_list) == len(result["input_ids"]), "MLM probs and input ids have different lengths"
+                        result["MLM_probs"] = mlm_probs_list
                         # propagate shard id and shard sample id to save MLM probs after we get it
                         result["shard_id"] = [shard_id]
                         result["shard_sample_id"] = [shard_sample_id]
-                print ("Done") # debug
+                # print ("Done") # debug
             return result
         else:
             raise RuntimeError("Data sample must contain a field with `text`")

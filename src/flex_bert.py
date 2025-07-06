@@ -221,7 +221,7 @@ class bpLoss(Metric):
             shard_sample_id = shard_sample_ids[idx_of_sample_in_batch]
             num_repeat = num_repeats[idx_of_sample_in_batch]
             save_path = os.path.join(self.filepath, f"shard_{shard_ids[idx_of_sample_in_batch]}.hdf5")
-            print ("Aquiring lock for", save_path) # debug
+            # print ("Aquiring lock for", save_path) # debug
             with FileLock(save_path+".lock"):
                 with h5py.File(save_path, "a") as f:
                     assert str(shard_sample_id) in f, f"shard_sample_id {shard_sample_id} not found in {save_path}"

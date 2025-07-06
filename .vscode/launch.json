@@ -13,7 +13,7 @@
             "cwd": "${workspaceFolder}",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}",
-                "CUDA_VISIBLE_DEVICES": "0",
+                "CUDA_VISIBLE_DEVICES": "0,1",
                 "TOKENIZERS_PARALLELISM": "0"
             },
             "python": "${command:python.interpreterPath}",

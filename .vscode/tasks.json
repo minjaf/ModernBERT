@@ -1,0 +1,51 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "clean-runs-directory",
+            "type": "shell",
+            "command": "rm",
+            "args": [
+                "-rf",
+                "${workspaceFolder}/runs/moderngena-base-pretrain-promoters_multi2"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "silent",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "clean-h5-directory",
+            "type": "shell",
+            "command": "rm",
+            "args": [
+                "-rf",
+                "m/nt/nfs_dna/minja/DNALM/promoter_pretrain/mds_v2/test/mlm_efficiency/*"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "silent",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "yamlConfig",
+            "type": "promptString",
+            "description": "Enter the path to your YAML configuration file",
+            "default": "yamls/moderngena/gena-base-pretrain_multi_promoters.yaml"
+        }
+    ]
+} 
