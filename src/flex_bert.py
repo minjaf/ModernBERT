@@ -33,6 +33,9 @@ from torchmetrics.classification.accuracy import MulticlassAccuracy, MultilabelA
 from torchmetrics.classification.matthews_corrcoef import MatthewsCorrCoef
 from torchmetrics.regression.spearman import SpearmanCorrCoef
 
+from filelock import FileLock
+import h5py
+
 try:
     from flash_attn.losses.cross_entropy import CrossEntropyLoss
 except ImportError:
@@ -140,6 +143,110 @@ class EfficientZLoss(Metric):
         # Return average loss over entire dataset
         return self.sum_loss / self.total_items  # type: ignore (third-party)
 
+class bpLoss(Metric):
+    """Torchmetric that grabs the per-sample per-token loss"""
+
+    # Make torchmetrics call update only once
+    full_state_update = False
+
+
+    def __init__(self, dist_sync_on_step: bool = False, filepath: str | None = None):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+        self.add_state("true_probs", default=[], dist_reduce_fx=None)
+        self.add_state("offset_starts", default=[], dist_reduce_fx=None)
+        self.add_state("offset_ends", default=[], dist_reduce_fx=None)        
+        self.add_state("shard_sample_ids", default=[], dist_reduce_fx=None)
+        self.add_state("shard_ids", default=[], dist_reduce_fx=None)
+        self.add_state("num_repeats", default=[], dist_reduce_fx=None)
+        self.add_state("N_toks_processes", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.filepath = filepath
+
+    def update(self, logits: Tensor, labels_reduced: Tensor, labels_full: Tensor, batch: dict) -> None:
+        """Updates the internal state with results from a new batch.
+
+        Args:
+            entropy (~torch.Tensor): A Tensor of entropy values to compare against.
+            offsets (~torch.Tensor): A Tensor of offsets to compare against.
+        """
+
+        assert (labels_reduced.size()[0] == (labels_full != -100).sum()).item(), "labels_reduced and labels_full have different number of non-masked tokens"
+        assert len(labels_full.size()) == len(batch["shard_id"].size()) == len(batch["shard_sample_id"].size()) == len(batch["offsets_mapping_starts"].size()) == len(batch["offsets_mapping_ends"].size()) == 2, "labels_full, shard_id, shard_sample_id, offsets_mapping_starts and offsets_mapping_ends must be a 2D tensor"
+        assert logits.size()[0] == labels_reduced.size()[0], "logits and labels_reduced have different batch sizes"
+        mask = labels_full != -100
+        logits = torch.softmax(logits, dim=1)
+        # logits is N_masked x V
+        # labels is N_masked
+        # Get the probability for each true token
+        true_probs = torch.gather(logits, dim=1, index=labels_reduced.unsqueeze(1)).squeeze(1)
+
+        offset_starts = batch["offsets_mapping_starts"][mask]
+        offset_ends = batch["offsets_mapping_ends"][mask]
+        assert torch.allclose(batch["shard_sample_id"].min(dim=1)[0], batch["shard_sample_id"].max(dim=1)[0]), "shard_sample_id must be unique value per sample in batch"
+        num_repeats = mask.sum(dim=1)
+        shard_sample_ids = batch["shard_sample_id"].flatten()
+        shard_ids = batch["shard_id"].flatten()
+        save_paths = batch["mlm_efficiency_path"]
+        
+        # samples_ids = torch.repeat_interleave(batch["shard_sample_id"].flatten(), mask.sum(dim=1))
+        
+        assert len(true_probs) == len(offset_starts) == len(offset_ends), "offset_starts, offset_ends, samples_ids and shard_ids must have the same length"
+        assert len(num_repeats) == len(shard_sample_ids) == len(shard_ids) == len(save_paths), "num_repeats, shard_sample_ids, shard_ids and save_paths must have the same length"
+        assert sum(num_repeats) == true_probs.size()[0], "num_repeats does not match the number of true probabilities"
+
+        self.true_probs.append(true_probs)
+        self.offset_starts.append(offset_starts)
+        self.offset_ends.append(offset_ends)
+        self.shard_sample_ids.append(shard_sample_ids)
+        self.shard_ids.append(shard_ids)
+        assert len(set(save_paths)) == 1, "save_paths must be the same for all samples in the batch"
+        save_path = save_paths[0]
+        if self.filepath is None:
+            self.filepath = save_path
+        assert self.filepath == save_path, "save_paths must be the same for all metric calls"
+        self.num_repeats.append(num_repeats)
+        self.N_toks_processes += true_probs.size()[0]
+
+    def _to_file(self, true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats):
+        idx_of_sample_in_batch = 0
+        idx_of_token_in_concatenated_batch = 0
+        # convert to numpy
+        true_probs = true_probs.cpu().numpy()
+        offset_starts = offset_starts.cpu().numpy()
+        offset_ends = offset_ends.cpu().numpy()
+        shard_sample_ids = shard_sample_ids.cpu().numpy()
+        shard_ids = shard_ids.cpu().numpy()
+        num_repeats = num_repeats.cpu().numpy()
+
+        while idx_of_sample_in_batch < len(shard_sample_ids):
+            shard_sample_id = shard_sample_ids[idx_of_sample_in_batch]
+            num_repeat = num_repeats[idx_of_sample_in_batch]
+            save_path = os.path.join(self.filepath, f"shard_{shard_ids[idx_of_sample_in_batch]}.hdf5")
+            print ("Aquiring lock for", save_path) # debug
+            with FileLock(save_path+".lock"):
+                with h5py.File(save_path, "a") as f:
+                    assert str(shard_sample_id) in f, f"shard_sample_id {shard_sample_id} not found in {save_path}"
+                    for i in range(num_repeat):
+                        st = offset_starts[idx_of_token_in_concatenated_batch]
+                        en = offset_ends[idx_of_token_in_concatenated_batch]
+                        f[str(shard_sample_id)][st:en] = 1. - true_probs[idx_of_token_in_concatenated_batch]
+                        idx_of_token_in_concatenated_batch += 1
+            idx_of_sample_in_batch += 1
+        assert idx_of_token_in_concatenated_batch == true_probs.shape[0], "idx_of_token_in_concatenated_batch does not match the number of true probabilities"
+
+    def compute(self):
+        """Aggregate the state over all processes to compute the metric.
+        """
+        # convert to tensors and concatenate
+        true_probs = torch.cat(self.true_probs, dim=0)
+        offset_starts = torch.cat(self.offset_starts, dim=0)
+        offset_ends = torch.cat(self.offset_ends, dim=0)
+        shard_sample_ids = torch.cat(self.shard_sample_ids, dim=0)
+        shard_ids = torch.cat(self.shard_ids, dim=0)
+        num_repeats = torch.cat(self.num_repeats, dim=0)
+
+        self._to_file(true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats)
+        return self.N_toks_processes.item()
+        # TODO. Should we reset the state? Let's belive trainer will do it for us
 
 class EfficientHuggingFaceModel(HuggingFaceModel):
     def eval_forward(self, batch, outputs: Optional[Any] = None):
@@ -160,6 +267,8 @@ class EfficientHuggingFaceModel(HuggingFaceModel):
             metric_result = metric.update(outputs["z_loss"])
         elif isinstance(metric, EfficientCrossEntropy):
             metric_result = metric.update(outputs["loss"])
+        elif isinstance(metric, bpLoss):
+            metric_result = metric.update(outputs["logits"], outputs.get("labels", None), self.labels, batch)
         else:
             metric_result = metric.update(outputs["logits"], outputs.get("labels", self.labels))
 
@@ -289,10 +398,15 @@ def create_flex_bert_mlm(
         metrics = [EfficientCrossEntropy()] + metrics
     if model_config.get("loss_kwargs", {}).get("return_z_loss", False):
         metrics += [EfficientZLoss()]
+    if model_config.get("update_mlm_probs", False):
+        metrics += [bpLoss(filepath=model_config.get("mlm_probs_path", None))]
 
     eval_metrics = copy.deepcopy(metrics)
+    eval_metrics = [m for m in eval_metrics if m.__class__.__name__ != "bpLoss"] # we do not need to compute bpLoss on eval set
     if disable_train_metrics:
-        metrics = None
+        metrics = [m for m in metrics if m.__class__.__name__ == "bpLoss"] # we always keep bpLoss on the training set
+        if len(metrics) == 0:
+            metrics = None
 
     hf_model = EfficientHuggingFaceModel(
         model=model,

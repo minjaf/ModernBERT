@@ -506,6 +506,7 @@ dependencies:
   - zstandard=0.23.0
   - biopython=1.83
   - tensorboard=2.15.2
+  - h5py=3.10.0
   - pip:
       - mosaicml==0.24.1
       - mosaicml-cli==0.6.41

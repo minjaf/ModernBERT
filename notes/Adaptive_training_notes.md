@@ -1,0 +1,52 @@
+Here is where we set training methods in trainer.py:
+
+```python
+    def _eval_train_metrics(self, device_batch):
+        assert self._train_data_spec is not None, 'The train data spec should be set on __init__ or fit()'
+        assert self.state.train_metrics is not None, 'The train metrics should be set on __init__ or fit()'
+        # We disable FP8 autocast in eval metrics and default to the activation dtype for the forward pass
+        # This is because FP8 in TE requires all eval data sizes to be divisible by 16 which does not hold for all evaluation datasets.
+        # See https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html for more info.
+        # Note: the activation dtype is BF16 if FSDP Mixed Precision PURE is enabled and FP32 if FSDP Mixed Precision FULL is enabled.
+        # See https://github.com/NVIDIA/TransformerEngine/blob/8e039fdcd98fc56582d81e373880c1509c2b8f73/transformer_engine/pytorch/module/linear.py#L250-L252 and \
+        # https://github.com/NVIDIA/TransformerEngine/blob/8e039fdcd98fc56582d81e373880c1509c2b8f73/transformer_engine/pytorch/module/base.py#L495-L513 for more info.
+        with torch.no_grad(),\
+                model_eval_mode(self.state.model),\
+                _get_precision_context(self.state.precision, self.state.precision_config, self.state.deepspeed_enabled, fp8_autocast_enabled=False):
+            eval_outputs = self._original_model.eval_forward(device_batch, self.state.outputs)
+            for metric in self.state.train_metrics.values():
+                self._original_model.update_metric(
+                    device_batch,
+                    eval_outputs,
+                    metric,
+                )
+```
+
+And here we set the outputs:
+
+```python
+    def _train_microbatch(...)
+			...
+            with _get_precision_context(
+                self.state.precision,
+                self.state.precision_config,
+                self.state.deepspeed_enabled,
+            ):
+                self.state.outputs = self.state.model(self.state.batch)
+```
+
+Here we define set of metrics:
+
+```python
+The metrics used are defined in your model's ``get_metrics()`` method. For more information,
+see :doc:`/trainer/evaluation`.
+```
+
+## Key modifications to implement adaptive MLM:
+
+1. **Dataset reads MLM probs** (`src/text_data.py`)
+2. **Dataset propagates data required to save MLM probs** (`src/text_data.py`)
+3. **Custom collate function** (`src/text_data.py`) to handle these additional inputs
+4. **The same collate function re-implements masking** to account for MLM masking (`src/text_data.py`)
+5. **Metrics class** that stores model prediction and flushes them to file when needed (`src/flex_bert.py`)
+6. **EfficientHuggingFaceModel modified** to handle this metrics (`src/flex_bert.py`)

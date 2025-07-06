@@ -1,0 +1,33 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug ModernBERT Training (Conda)",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "yamls/moderngena/gena-base-test_mlm_probs.yaml"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "0",
+                "TOKENIZERS_PARALLELISM": "0"
+            },
+            "python": "${command:python.interpreterPath}",
+            "justMyCode": false,
+            "stopOnEntry": false,
+            "preLaunchTask": "clean-runs-directory"
+        },
+    ],
+    "inputs": [
+        {
+            "id": "yamlConfig",
+            "type": "promptString",
+            "description": "Enter the path to your YAML configuration file",
+            "default": "yamls/moderngena/gena-base-test_mlm_probs.yaml"
+        }
+    ]
+} 

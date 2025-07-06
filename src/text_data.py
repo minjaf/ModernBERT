@@ -30,9 +30,12 @@ from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizer
 from streaming.base.format import reader_from_json
 from streaming.base.spanner import Spanner
 from composer.utils import dist
-
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Mapping
+from transformers.data.data_collator import default_data_collator
 from transformers.tokenization_utils_base import BatchEncoding
 
+from filelock import FileLock
+import h5py
 from Bio.Seq import Seq
 
 # Add src folder root to path to allow us to use relative imports regardless of what directory the script is run from
@@ -264,6 +267,128 @@ class StreamingTextDataset(StreamingDataset):
         return token_sample
 
 
+# We need a custom collator for MLM probs propagation
+class DataCollatorForLanguageModelingWithMLMProbs(transformers.DataCollatorForLanguageModeling):
+    def tf_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
+        raise NotImplementedError("TF is not supported for MLM with MLM probs")
+    
+    # TODO: implement masking probabilities
+    def torch_mask_tokens(self, inputs: Any, 
+                          special_tokens_mask: Optional[Any] = None,
+                          mask_probs_array: Optional[Any] = None,
+                          ) -> Tuple[Any, Any]:
+        """
+        Prepare masked tokens inputs/labels for masked language modeling.
+        Based on the original implementation of transformers' `DataCollatorForLanguageModeling.torch_mask_tokens`
+        
+        It performs masking in a way that produces on expectation the following masked inputs:
+         - (1-self.mlm_probability) of the original positions will be untouched.
+         - self.mlm_probability * 80%  of the original positions get replaced with a mask token
+         - self.mlm_probability * 10%  of the original positions get replaced with a random token
+         - self.mlm_probability * 10%  of the original positions also remain untouched.
+        This generates the masked_inputs.
+
+        It also generates a labels array, which has ignore tokens in the (1-mask_prob) positions
+
+        These proportions are expectation values since the random transformation is performed
+        """
+        # TODO: check if any corrections are needed to tenzors that are not 2D
+        assert len(inputs.shape) == 2, f"inputs must be a 2D tensor, bsize * input_len, but got {inputs.shape}"
+        labels = inputs.clone()
+       
+        # We sample a few tokens in each sequence for MLM training (with probability `self.mlm_probability`)
+        if mask_probs_array is not None:
+            # Validate that mask_probs_array has the same shape as seq
+            if mask_probs_array.shape != labels.shape:
+                raise ValueError(f"mask_probs_array shape {mask_probs_array.shape} must match labels shape {labels.shape}")
+            
+            # Normalize mask_probs_array so that the average probability equals mask_prob
+            # This ensures that approximately mask_prob * 100% of tokens are masked overall
+            avg_prob = torch.mean(mask_probs_array, dim=1)
+            assert torch.all(avg_prob <= 1.0), f"avg_prob {avg_prob} must be less than 1.0"
+            assert torch.all(avg_prob > 0.0), f"avg_prob {avg_prob} must be greater than 0.0"
+            # Scale the probabilities to maintain the target average
+            print (mask_probs_array.size(), avg_prob.unsqueeze(1).size())
+            mask_probs = mask_probs_array * (self.mlm_probability / avg_prob.unsqueeze(1))
+            # Clip to ensure probabilities stay in [0, 1] range
+            mask_probs = torch.clip(mask_probs, 0.0, 1.0)
+            probability_matrix = mask_probs
+        else:
+            probability_matrix = torch.full(labels.shape, self.mlm_probability)
+            
+        if special_tokens_mask is None:
+            special_tokens_mask = [
+                self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
+            ]
+            special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool)
+        else:
+            special_tokens_mask = special_tokens_mask.bool()
+
+        probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
+        masked_indices = torch.bernoulli(probability_matrix).bool()
+        labels[~masked_indices] = -100  # We only compute loss on masked tokens
+
+        # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
+        indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
+        inputs[indices_replaced] = self.tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token)
+
+        # 10% of the time, we replace masked input tokens with random word
+        indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
+        random_words = torch.randint(len(self.tokenizer), labels.shape, dtype=torch.long)
+        inputs[indices_random] = random_words[indices_random]
+
+        # The rest of the time (10% of the time) we keep the masked input tokens unchanged
+        return inputs, labels
+    
+    def numpy_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
+        raise NotImplementedError("Numpy is not supported for MLM with MLM probs")
+
+    def numpy_mask_tokens(self, inputs: Any, special_tokens_mask: Optional[Any] = None) -> Tuple[Any, Any]:
+        raise NotImplementedError("Numpy is not supported for MLM with MLM probs")
+
+    def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
+        # Handle dict or lists with proper padding and conversion to tensor.
+        if isinstance(examples[0], Mapping):
+            # we don't need padding here, because we do pad ourselves in the dataset
+            # batch = pad_without_fast_tokenizer_warning(
+            #     self.tokenizer, examples, return_tensors="pt", pad_to_multiple_of=self.pad_to_multiple_of
+            # )
+            # handle mlm_efficiency_path
+            if "mlm_efficiency_path" in examples[0]:
+                mlm_efficiency_paths = [example.pop("mlm_efficiency_path") for example in examples]
+            else:
+                mlm_efficiency_paths = None
+            
+            # now handle all tensors
+            batch = default_data_collator(examples, self.return_tensors)
+            
+            # and keep the mlm_efficiency_path as single value in the batch
+            if mlm_efficiency_paths is not None: 
+                batch["mlm_efficiency_path"] = mlm_efficiency_paths
+        else:
+            raise NotImplementedError("Only dicts are supported for MLM with MLM probs")
+            # batch = {
+            #     "input_ids": _torch_collate_batch(examples, self.tokenizer, pad_to_multiple_of=self.pad_to_multiple_of)
+            # }
+
+        # If special token mask has been preprocessed, pop it from the dict.
+        special_tokens_mask = batch.pop("special_tokens_mask", None)
+        if self.mlm:
+            if "mask_probs_array" in batch:
+                batch["input_ids"], batch["labels"] = self.torch_mask_tokens(
+					batch["input_ids"], special_tokens_mask=special_tokens_mask, mask_probs_array=batch["mask_probs_array"]
+				)
+            else:
+                batch["input_ids"], batch["labels"] = self.torch_mask_tokens(
+					batch["input_ids"], special_tokens_mask=special_tokens_mask
+				)
+        else:
+            labels = batch["input_ids"].clone()
+            if self.tokenizer.pad_token_id is not None:
+                labels[labels == self.tokenizer.pad_token_id] = -100
+            batch["labels"] = labels
+        return batch
+
 class ConcatenatedSequenceCollatorWrapper:
     """Collator wrapper to add sequence_id to batch."""
 
@@ -370,7 +495,9 @@ def build_no_streaming_dataset(
             pad_sequences=pad_sequences,
             augment_rc=cfg.dataset.get("augment_rc", False),
             sample_chunk=cfg.dataset.get("sample_chunk", False),
-            min_seq_len=cfg.dataset.get("min_seq_len", 10)
+            min_seq_len=cfg.dataset.get("min_seq_len", 10),
+            mlm_efficiency_path=cfg.dataset.get("mlm_efficiency_path", None),
+            append_mlm_efficiency=cfg.dataset.get("append_mlm_efficiency", False),
         )
     else:
         return NoStreamingDataset(
@@ -403,7 +530,7 @@ def build_text_dataloader(
     else:
         assert cfg.dataset.get("local", None) is not None, "Local path must be provided when not using streaming"
         # sequence packing should never use padded sequences, regular dataloaders may if tokenizing on the fly
-        dataset = build_no_streaming_dataset(cfg, tokenizer=tokenizer, pad_sequences=use_sequence_packing)
+        dataset = build_no_streaming_dataset(cfg, tokenizer=tokenizer, pad_sequences=not use_sequence_packing) # seems to be a bug in the original code
         sampler = DistributedSamplerPCG64DXSM(
             dataset,
             num_replicas=dist.get_world_size(),
@@ -414,9 +541,13 @@ def build_text_dataloader(
         )
 
     mlm_probability = cfg.dataset.get("mlm_probability", None)
+    use_adaptive_mlm_probability = cfg.dataset.get("mlm_efficiency_path", None) is not None
     # only use sequence packing if using the no_streaming_dataset
     # if not cfg.dataset.get("streaming", True) and cfg.get("sequence_packing", False):
     if use_sequence_packing:
+        # if use_adaptive_mlm_probability: # TODO: implement adaptive MLM probability
+        #     raise NotImplementedError("Adaptive MLM probability is not supported for sequence packing")
+            
         if cfg.dataset.get("streaming", True):
             # streaming dataset already handles splitting and shuffling data for each rank
             dataloader = DataLoader(
@@ -465,9 +596,14 @@ def build_text_dataloader(
         buffered_iterable = BufferedIterable(sequence_packer, buffer_size=cfg.get("packing_prefetch_factor", 5))
         return buffered_iterable
     else:
-        collate_fn = transformers.DataCollatorForLanguageModeling(
+        # dataset.tokenizer.model_input_names.append("MLM_probs") # TODO: make something more graceful
+        collate_fn = DataCollatorForLanguageModelingWithMLMProbs(
             tokenizer=dataset.tokenizer, mlm=mlm_probability is not None, mlm_probability=mlm_probability
         )
+
+        # collate_fn = transformers.DataCollatorForLanguageModeling(
+        #     tokenizer=dataset.tokenizer, mlm=mlm_probability is not None, mlm_probability=mlm_probability
+        # )
 
         eos_token_id = cfg.dataset.get("eos_token_id")
         bos_token_id = cfg.dataset.get("bos_token_id")
@@ -563,6 +699,7 @@ class NoStreamingDataset(Dataset):
 
 
 class NoStreamingGenomeDataset(NoStreamingDataset):
+    MLM_PROB_DTYPE = np.float16
 
     def __init__(
         self,
@@ -574,12 +711,25 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         augment_rc: bool = False,
         sample_chunk: bool = False,
         min_seq_len: int = 10,
+        mlm_efficiency_path: str | None = None,
+        append_mlm_efficiency: bool = False,
     ) -> None:
         super().__init__(local, split, max_seq_len, tokenizer, pad_sequences)
         # todo: add seed and check that its ok for multiple workers
         self.augment_rc = augment_rc
         self.sample_chunk = sample_chunk
         self.min_seq_len = min_seq_len
+        self.mlm_efficiency_path = mlm_efficiency_path
+        if self.mlm_efficiency_path is not None:
+            if split is None:
+                raise ValueError("Split is required to save mlm efficiency")
+            self.mlm_efficiency_path = self._get_full_mlm_efficiency_path(split)
+            os.makedirs(self.mlm_efficiency_path, exist_ok=append_mlm_efficiency)
+
+    def _get_full_mlm_efficiency_path(self, split: str) -> str:
+        if self.mlm_efficiency_path is None:
+            return None
+        return os.path.join(self.mlm_efficiency_path, split + "/")
 
     def _tokenize(self, text_sample):
         assert self.tokenizer is not None, "Tokenizer required if data is not pretokenized"
@@ -603,12 +753,72 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         if self.augment_rc and random.random() > 0.5:
             text = str(Seq(text).reverse_complement())
 
-        return self.tokenizer(
-            text,
-            truncation=True,
-            padding="max_length" if self.pad_sequences else False,
-            max_length=max_seq_len,
-        )
+        if self.mlm_efficiency_path:
+            # we need to 
+            # 1) load the mlm efficiency data
+            # 2) propagate offeset mapping through the model to save predicts later
+            result = self.tokenizer(
+                text,
+                truncation=True,
+                padding="max_length" if self.pad_sequences else False,
+                max_length=self.max_seq_len if self.pad_sequences else max_seq_len, # if we have sequence packing, we do not padd and truncate to max_seq_len; else we should have all sequences  having strictly the same length
+                return_offsets_mapping=True,
+            )
+            result["offsets_mapping_starts"] = [st_index + offset[0] for offset in result["offset_mapping"]]
+            result["offsets_mapping_ends"] = [st_index + offset[1] for offset in result["offset_mapping"]]
+            del result["offset_mapping"]
+            assert len(result["input_ids"]) == len(result["offsets_mapping_starts"]) == len(result["offsets_mapping_ends"]), "Offsets mapping and input_ids have different lengths"
+        else:
+            result = self.tokenizer(
+                text,
+                truncation=True,
+                padding="max_length" if self.pad_sequences else False,
+                max_length=max_seq_len if self.pad_sequences else self.max_seq_len, # if we have sequence packing, we do not padd and truncate to max_seq_len; else we should have all sequences  having strictly the same length
+            )
+        
+        return result
+
+    def __getitem__(self, index: int):
+        shard_id, shard_sample_id = self.spanner[index]
+        shard = self.shards[shard_id]
+        sample = shard[shard_sample_id]
+        if "text" in sample:
+            result = self._tokenize(sample)
+            if self.mlm_efficiency_path:
+                # check if we have hdf_file
+                hdf5_file = os.path.join(self.mlm_efficiency_path, f"shard_{shard_id}.hdf5")
+                result["mlm_efficiency_path"] = self.mlm_efficiency_path
+
+                if not os.path.exists(hdf5_file):
+                    print (f"Shard shard_{shard_id}.hdf5 not found") # debug
+                    with FileLock(hdf5_file+".lock"):
+                        print (f"Creating shard shard_{shard_id}.hdf5") # debug
+                        with h5py.File(hdf5_file, "w") as f:
+                            f.create_dataset(str(shard_sample_id), data=[np.nan]*len(sample['text']), dtype=self.MLM_PROB_DTYPE)
+
+                # check if we have sample in hdf_file
+                print ("Acquiring mlm probs for ", hdf5_file) # debug
+                with FileLock(hdf5_file+".lock"):
+                    with h5py.File(hdf5_file, "a") as f:
+                        if str(shard_sample_id) not in f:
+                            print (f"Sample {shard_sample_id} not found in shard_{shard_id}.hdf5") # debug
+                            f.create_dataset(str(shard_sample_id), data=[np.nan]*len(sample['text']), dtype=self.MLM_PROB_DTYPE)
+
+                        start_index = result["offsets_mapping_starts"][0]
+                        end_index = result["offsets_mapping_ends"][-1]
+                        mlm_probs = f[str(shard_sample_id)][start_index:end_index]
+                        mlm_probs = np.nan_to_num(mlm_probs, nan=1.0, copy=False) # probability=1.0 for unseen positions
+                        # mlm_probs are stored in base-pair resolution, so we need to convert them to bpe-token resolution according to offsets_mapping
+                        mlm_probs = [sum(mlm_probs[tok_start:tok_end]) for tok_start,tok_end in zip(result["offsets_mapping_starts"], result["offsets_mapping_ends"])]
+                        assert len(mlm_probs) == len(result["input_ids"]), "MLM probs and input ids have different lengths"
+                        result["MLM_probs"] = mlm_probs
+                        # propagate shard id and shard sample id to save MLM probs after we get it
+                        result["shard_id"] = [shard_id]
+                        result["shard_sample_id"] = [shard_sample_id]
+                print ("Done") # debug
+            return result
+        else:
+            raise RuntimeError("Data sample must contain a field with `text`")
 
 
 # Helpful to test if your dataloader is working locally
