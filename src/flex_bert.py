@@ -35,6 +35,8 @@ from torchmetrics.regression.spearman import SpearmanCorrCoef
 
 from filelock import FileLock
 import h5py
+import numpy as np
+import datetime
 
 try:
     from flash_attn.losses.cross_entropy import CrossEntropyLoss
@@ -150,7 +152,8 @@ class bpLoss(Metric):
     full_state_update = False
 
 
-    def __init__(self, dist_sync_on_step: bool = False, filepath: str | None = None):
+    def __init__(self, dist_sync_on_step: bool = False, filepath: str | None = None, 
+            write2file_threshold: float = 0.2):
         super().__init__(dist_sync_on_step=dist_sync_on_step)
         self.add_state("true_probs", default=[], dist_reduce_fx=None)
         self.add_state("offset_starts", default=[], dist_reduce_fx=None)
@@ -158,8 +161,10 @@ class bpLoss(Metric):
         self.add_state("shard_sample_ids", default=[], dist_reduce_fx=None)
         self.add_state("shard_ids", default=[], dist_reduce_fx=None)
         self.add_state("num_repeats", default=[], dist_reduce_fx=None)
-        self.add_state("N_toks_processes", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("N_toks_processed", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("mean_non_pad_MLM_probs", default=[], dist_reduce_fx="mean")
         self.filepath = filepath
+        self.write2file_threshold = write2file_threshold
 
     def update(self, logits: Tensor, labels_reduced: Tensor, labels_full: Tensor, batch: dict) -> None:
         """Updates the internal state with results from a new batch.
@@ -178,11 +183,24 @@ class bpLoss(Metric):
         # labels is N_masked
         # Get the probability for each true token
         true_probs = torch.gather(logits, dim=1, index=labels_reduced.unsqueeze(1)).squeeze(1)
+        # print ("------>Mean of true_probs: ", true_probs.mean().item())
+        # print ("------>Max of true_probs: ", true_probs.max().item())
+        # print ("------>N of true_probs > self.write2file_threshold: ", (true_probs > self.write2file_threshold).sum().item(), " out of ", true_probs.size()[0])
 
         offset_starts = batch["offsets_mapping_starts"][mask]
         offset_ends = batch["offsets_mapping_ends"][mask]
+        assert torch.all(offset_ends - offset_starts > 0), "offset_ends must be greater than offset_starts"
         assert torch.allclose(batch["shard_sample_id"].min(dim=1)[0], batch["shard_sample_id"].max(dim=1)[0]), "shard_sample_id must be unique value per sample in batch"
         num_repeats = mask.sum(dim=1)
+        if num_repeats.min() == 0:
+            print("Example of batch where num_repeats == 0:")
+            print(f"num_repeats: {num_repeats}")
+            print(f"labels_full shape: {labels_full.shape}")
+            print(f"mask shape: {mask.shape}")
+            print(f"mask sum per sample: {mask.sum(dim=1)}")
+            print(f"labels_full sample: {labels_full[0] if labels_full.size(0) > 0 else 'empty'}")
+            print(f"mask sample: {mask[0] if mask.size(0) > 0 else 'empty'}")
+            print("This indicates some samples have no masked tokens to predict")
         shard_sample_ids = batch["shard_sample_id"].flatten()
         shard_ids = batch["shard_id"].flatten()
         save_paths = batch["mlm_efficiency_path"]
@@ -202,9 +220,10 @@ class bpLoss(Metric):
         save_path = save_paths[0]
         if self.filepath is None:
             self.filepath = save_path
-        assert self.filepath == save_path, "save_paths must be the same for all metric calls"
+        assert self.filepath == save_path, f"save_paths must be the same for all metric calls, {self.filepath} != {save_path}"
         self.num_repeats.append(num_repeats)
-        self.N_toks_processes += true_probs.size()[0]
+        self.N_toks_processed += true_probs.size()[0]
+        self.mean_non_pad_MLM_probs.append(batch["mean_non_pad_MLM_probs"])
 
     def _to_file(self, true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats):
         idx_of_sample_in_batch = 0
@@ -217,21 +236,45 @@ class bpLoss(Metric):
         shard_ids = shard_ids.cpu().numpy()
         num_repeats = num_repeats.cpu().numpy()
 
+        timedelta_opening_file = datetime.timedelta(0)
+        timedelta_writing_to_file = datetime.timedelta(0)
+
         while idx_of_sample_in_batch < len(shard_sample_ids):
             shard_sample_id = shard_sample_ids[idx_of_sample_in_batch]
             num_repeat = num_repeats[idx_of_sample_in_batch]
+            if num_repeat == 0:
+                idx_of_sample_in_batch += 1
+                continue
             save_path = os.path.join(self.filepath, f"shard_{shard_ids[idx_of_sample_in_batch]}.hdf5")
-            # print ("Aquiring lock for", save_path) # debug
+            max_probability = true_probs[idx_of_token_in_concatenated_batch:idx_of_token_in_concatenated_batch+num_repeat].max()
+            
+            # skip if max probability of all tokens in the sample is less than write2file_threshold
+            if max_probability < self.write2file_threshold:
+                idx_of_token_in_concatenated_batch += num_repeat
+                idx_of_sample_in_batch += 1
+                continue
+
+            timestamp = datetime.datetime.now()
             with FileLock(save_path+".lock"):
                 with h5py.File(save_path, "a") as f:
+                    timedelta_opening_file += datetime.datetime.now() - timestamp
+                    timestamp = datetime.datetime.now()
                     assert str(shard_sample_id) in f, f"shard_sample_id {shard_sample_id} not found in {save_path}"
+                    data = f[str(shard_sample_id)][:] # read all data
                     for i in range(num_repeat):
-                        st = offset_starts[idx_of_token_in_concatenated_batch]
-                        en = offset_ends[idx_of_token_in_concatenated_batch]
-                        f[str(shard_sample_id)][st:en] = 1. - true_probs[idx_of_token_in_concatenated_batch]
+                        # update only if true prob is > write2file_threshold to save time
+                        if true_probs[idx_of_token_in_concatenated_batch] > self.write2file_threshold:
+                            st = offset_starts[idx_of_token_in_concatenated_batch]
+                            en = offset_ends[idx_of_token_in_concatenated_batch]
+                            data[st:en] = 1. - true_probs[idx_of_token_in_concatenated_batch] # update in memory
+                            # f[str(shard_sample_id)][st:en] = 1. - true_probs[idx_of_token_in_concatenated_batch]
                         idx_of_token_in_concatenated_batch += 1
+                    f[str(shard_sample_id)][:] = data # single write operation
+                    timedelta_writing_to_file += datetime.datetime.now() - timestamp
             idx_of_sample_in_batch += 1
         assert idx_of_token_in_concatenated_batch == true_probs.shape[0], "idx_of_token_in_concatenated_batch does not match the number of true probabilities"
+        # print ("---->timedelta_opening_file = ", timedelta_opening_file.total_seconds() * 1000)
+        # print ("---->timedelta_writing_to_file = ", timedelta_writing_to_file.total_seconds() * 1000)
 
     def compute(self):
         """Aggregate the state over all processes to compute the metric.
@@ -243,9 +286,11 @@ class bpLoss(Metric):
         shard_sample_ids = torch.cat(self.shard_sample_ids, dim=0)
         shard_ids = torch.cat(self.shard_ids, dim=0)
         num_repeats = torch.cat(self.num_repeats, dim=0)
+        mean_non_pad_MLM_probs = torch.cat(self.mean_non_pad_MLM_probs, dim=0)
 
         self._to_file(true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats)
-        return self.N_toks_processes.item()
+        # return self.N_toks_processed.item()
+        return mean_non_pad_MLM_probs.mean().item()
         # TODO. Should we reset the state? Let's belive trainer will do it for us
 
 class EfficientHuggingFaceModel(HuggingFaceModel):
@@ -398,8 +443,8 @@ def create_flex_bert_mlm(
         metrics = [EfficientCrossEntropy()] + metrics
     if model_config.get("loss_kwargs", {}).get("return_z_loss", False):
         metrics += [EfficientZLoss()]
-    if model_config.get("update_mlm_probs", False):
-        metrics += [bpLoss(filepath=model_config.get("mlm_probs_path", None))]
+    if model_config.get("save_mlm_probs", None) is not None:
+        metrics += [bpLoss(**model_config.get("save_mlm_probs", {}))]
 
     eval_metrics = copy.deepcopy(metrics)
     eval_metrics = [m for m in eval_metrics if m.__class__.__name__ != "bpLoss"] # we do not need to compute bpLoss on eval set

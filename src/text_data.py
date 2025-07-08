@@ -295,6 +295,16 @@ class DataCollatorForLanguageModelingWithMLMProbs(transformers.DataCollatorForLa
         # TODO: check if any corrections are needed to tenzors that are not 2D
         assert len(inputs.shape) == 2, f"inputs must be a 2D tensor, bsize * input_len, but got {inputs.shape}"
         labels = inputs.clone()
+
+        if special_tokens_mask is None:
+            special_tokens_mask = [
+                self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
+            ]
+            special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool)
+        else:
+            special_tokens_mask = special_tokens_mask.bool()
+        
+        Num_non_special_tokens = (~special_tokens_mask).sum(dim=1).float()
        
         # We sample a few tokens in each sequence for MLM training (with probability `self.mlm_probability`)
         if mask_probs_array is not None:
@@ -304,7 +314,13 @@ class DataCollatorForLanguageModelingWithMLMProbs(transformers.DataCollatorForLa
             
             # Normalize mask_probs_array so that the average probability equals mask_prob
             # This ensures that approximately mask_prob * 100% of tokens are masked overall
-            avg_prob = torch.mean(mask_probs_array, dim=1)
+            mask_probs_array.masked_fill_(special_tokens_mask, value=0.0)
+            # average across non-special-tokens
+            # if denominator is 0, set it to 1 and convert to float
+            denominator = torch.where(Num_non_special_tokens == 0, 
+                                    torch.ones_like(Num_non_special_tokens), 
+                                    Num_non_special_tokens).float()
+            avg_prob = torch.sum(mask_probs_array, dim=1) / denominator
             assert torch.all(avg_prob <= 1.0), f"avg_prob {avg_prob} must be less than 1.0"
             assert torch.all(avg_prob > 0.0), f"avg_prob {avg_prob} must be greater than 0.0"
             # Scale the probabilities to maintain the target average
@@ -315,16 +331,17 @@ class DataCollatorForLanguageModelingWithMLMProbs(transformers.DataCollatorForLa
         else:
             probability_matrix = torch.full(labels.shape, self.mlm_probability)
             
-        if special_tokens_mask is None:
-            special_tokens_mask = [
-                self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
-            ]
-            special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool)
-        else:
-            special_tokens_mask = special_tokens_mask.bool()
-
         probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
         masked_indices = torch.bernoulli(probability_matrix).bool()
+        # compute fraction of masked tokens
+        # print ("--------------------------------")
+        # print (f"mlm_probability: {self.mlm_probability}")
+        # print (f"Num_non_special_tokens: {Num_non_special_tokens}")
+        # fraction_masked = masked_indices.sum(dim=1).float() / Num_non_special_tokens
+        # print (f"Average fraction of masked tokens: {fraction_masked.mean()}")
+        # # print (f"Fraction of masked tokens: {fraction_masked}")
+        # print ("--------------------------------")
+
         labels[~masked_indices] = -100  # We only compute loss on masked tokens
 
         # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
@@ -750,6 +767,8 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         text = text[:max_seq_len * 10]  # cut to make tokenization faster if text is too long
 
         if self.augment_rc and random.random() > 0.5:
+            if self.mlm_efficiency_path:
+                raise NotImplementedError("Reverse complement is not supported for adaptive masking")
             text = str(Seq(text).reverse_complement())
 
         if self.mlm_efficiency_path:
@@ -772,7 +791,7 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
                 text,
                 truncation=True,
                 padding="max_length" if self.pad_sequences else False,
-                max_length=max_seq_len if self.pad_sequences else self.max_seq_len, # if we have sequence packing, we do not padd and truncate to max_seq_len; else we should have all sequences  having strictly the same length
+                max_length=self.max_seq_len if self.pad_sequences else max_seq_len, # if we have sequence packing, we do not padd and truncate to max_seq_len; else we should have all sequences  having strictly the same length
             )
         
         return result
@@ -789,9 +808,9 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
                 result["mlm_efficiency_path"] = self.mlm_efficiency_path
 
                 if not os.path.exists(hdf5_file):
-                    print (f"Shard shard_{shard_id}.hdf5 not found") # debug
+                    # print (f"Shard shard_{shard_id}.hdf5 not found") # debug
                     with FileLock(hdf5_file+".lock"):
-                        print (f"Creating shard shard_{shard_id}.hdf5") # debug
+                        # print (f"Creating shard shard_{shard_id}.hdf5") # debug
                         with h5py.File(hdf5_file, "w") as f:
                             f.create_dataset(str(shard_sample_id), data=[np.nan]*len(sample['text']), dtype=self.MLM_PROB_DTYPE)
 
@@ -811,13 +830,19 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
                         mlm_probs = np.nan_to_num(mlm_probs, nan=1.0, copy=False) # probability=1.0 for unseen positions
                         # mlm_probs are stored in base-pair resolution, so we need to convert them to bpe-token resolution according to offsets_mapping
                         mlm_probs_list = []
+                        non_pad_MLM_probs = []
                         for tok_start,tok_end in zip(result["offsets_mapping_starts"], result["offsets_mapping_ends"]):
                             if tok_end - tok_start == 0: # service tokens and padding
                                 mlm_probs_list.append(0.)
                             elif tok_end - tok_start > 0:
                                 mlm_probs_list.append(np.mean(mlm_probs[tok_start-start_index:tok_end-start_index]))
+                                non_pad_MLM_probs.append(np.mean(mlm_probs[tok_start-start_index:tok_end-start_index]))
                             else:
                                 raise ValueError(f"tok_end - tok_start = {tok_end - tok_start} is negative")
+                        if len(non_pad_MLM_probs) > 0:
+                            result["mean_non_pad_MLM_probs"] = np.mean(non_pad_MLM_probs)
+                        else:
+                            raise ValueError("No mlm probs found")
                         assert len(mlm_probs_list) == len(result["input_ids"]), "MLM probs and input ids have different lengths"
                         result["MLM_probs"] = mlm_probs_list
                         # propagate shard id and shard sample id to save MLM probs after we get it

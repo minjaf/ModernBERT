@@ -50,3 +50,39 @@ see :doc:`/trainer/evaluation`.
 4. **The same collate function re-implements masking** to account for MLM masking (`src/text_data.py`)
 5. **Metrics class** that stores model prediction and flushes them to file when needed (`src/flex_bert.py`)
 6. **EfficientHuggingFaceModel modified** to handle this metrics (`src/flex_bert.py`)
+
+# Writing to file.
+
+a1)
+```
+for i in range(num_repeat):
+    # update only if true prob is > write2file_threshold to save time
+    if true_probs[idx_of_token_in_concatenated_batch] > self.write2file_threshold:
+        st = offset_starts[idx_of_token_in_concatenated_batch]
+        en = offset_ends[idx_of_token_in_concatenated_batch]
+        f[str(shard_sample_id)][st:en] = 1. - true_probs[idx_of_token_in_concatenated_batch]
+    idx_of_token_in_concatenated_batch += 1
+```
+a2)
+```
+data = f[str(shard_sample_id)][:] # read all data
+for i in range(num_repeat):
+    # update only if true prob is > write2file_threshold, to save time
+    if true_probs[idx_of_token_in_concatenated_batch] > self.write2file_threshold:
+        st = offset_starts[idx_of_token_in_concatenated_batch]
+        en = offset_ends[idx_of_token_in_concatenated_batch]
+        data[st:en] = 1. - true_probs[idx_of_token_in_concatenated_batch] # update in memory
+    idx_of_token_in_concatenated_batch += 1
+f[str(shard_sample_id)][:] = data # single write operation
+```
+
+a1) write all values, replace each in file  --> ~3-4k msec
+
+
+a2) write vals with gt_prob>0.5, replace each in file --> ~400-600 msec
+
+
+b1) write all values, read all to mem, replace 'in mem', flush all to file --> 80 msec
+
+
+b2) write val with gt_prob>0.5, read all to mem, replace 'in mem', flush all to file --> 50-60 msec 

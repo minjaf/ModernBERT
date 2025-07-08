@@ -1,0 +1,3 @@
+# Exclude runs folder from Cursor file system watching
+runs/
+runs/* 
