@@ -353,6 +353,9 @@ def init_from_checkpoint(cfg: DictConfig, new_model: nn.Module):
     state_dict = state.get("state", {})
     model_state = state_dict.get("model", {})
     assert len(model_state) > 0, "Model state is empty, please check the checkpoint and checkpoint path"
+    if cfg.get("only_load_weights", False):
+        new_model.load_state_dict(model_state, strict=True)
+        return
 
     pretrained_model.load_state_dict(model_state)
 
