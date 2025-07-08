@@ -86,3 +86,63 @@ b1) write all values, read all to mem, replace 'in mem', flush all to file --> 8
 
 
 b2) write val with gt_prob>0.5, read all to mem, replace 'in mem', flush all to file --> 50-60 msec 
+
+# to test code (obtain and visualyze MLM probs), 
+
+1) modify trainer.py (part of composer):
+
+before
+
+```
+                total_loss_dict = self._train_batch(use_grad_scaling)
+
+                if use_grad_scaling:
+                    self.state.scaler.update()
+```
+
+add code:
+
+```
+                # # Store initial weight norms
+                # wasinit = False 
+                # try:
+                #     # is initial_weight_norms defined?
+                #     initial_weight_norms
+                # except NameError:
+                #     wasinit = True
+                #     initial_weight_norms = {}
+                #     with torch.no_grad():
+                #         for name, param in self.state.model.named_parameters():
+                #             initial_weight_norms[name] = param.data.clone()
+                
+                # with torch.no_grad():
+```
+
+and after, add code:
+
+
+                # for name, param in self.state.model.named_parameters():
+                #     param.data = initial_weight_norms[name].detach()
+
+                # print ("############### DEBUG - AFTER TRAIN BATCH ############### (wasinit = ", wasinit, ")")
+                
+                # # Check if weights were updated
+                # weight_changes = {}
+                # with torch.no_grad():
+                #     for name, param in self.state.model.named_parameters():
+                #         if param.requires_grad and name in initial_weight_norms:
+                #             weight_diff = torch.norm(param.data - initial_weight_norms[name])
+                #             if weight_diff > 1e-8:  # Small threshold for numerical precision
+                #                 weight_changes[name] = weight_diff.item()
+                #                 param.data = initial_weight_norms[name].detach()
+                
+                # if weight_changes:
+                #     print(f"WARNING: Weights were updated! Changes detected in {len(weight_changes)} parameters:")
+                #     for name, change in weight_changes.items():
+                #         print(f"  {name}: {change:.2e}")
+                # else:
+                #     print("SUCCESS: No weight updates detected - weights are frozen as expected")
+
+Also modify DataCollatorForLanguageModelingWithMLMProbs and set `mask_probs_array` to 1.0 constantly.
+
+Then run with config proceed with `yamls/debug/gena-base-adaptive_mlm_debug.yaml`, let it process ~500 epoches, and proceed with `notebooks/test_MLM_probs.ipynb`. This will generate bedGraphs for IGV.
