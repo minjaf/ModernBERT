@@ -153,7 +153,7 @@ class bpLoss(Metric):
 
 
     def __init__(self, dist_sync_on_step: bool = False, filepath: str | None = None, 
-            write2file_threshold: float = 0.2):
+            write2file_threshold: float = 0.0):
         super().__init__(dist_sync_on_step=dist_sync_on_step)
         self.add_state("true_probs", default=[], dist_reduce_fx=None)
         self.add_state("offset_starts", default=[], dist_reduce_fx=None)
