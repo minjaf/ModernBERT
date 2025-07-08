@@ -515,6 +515,7 @@ def build_no_streaming_dataset(
             min_seq_len=cfg.dataset.get("min_seq_len", 10),
             mlm_efficiency_path=cfg.dataset.get("mlm_efficiency_path", None),
             append_mlm_efficiency=cfg.dataset.get("append_mlm_efficiency", False),
+            use_mlm_efficiency_frequency=cfg.dataset.get("use_mlm_efficiency_frequency", 1)
         )
     else:
         return NoStreamingDataset(
@@ -729,6 +730,7 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         min_seq_len: int = 10,
         mlm_efficiency_path: str | None = None,
         append_mlm_efficiency: bool = False,
+        use_mlm_efficiency_frequency: float = 1.0,
     ) -> None:
         super().__init__(local, split, max_seq_len, tokenizer, pad_sequences)
         # todo: add seed and check that its ok for multiple workers
@@ -762,6 +764,7 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
                 raise ValueError("Split is required to save mlm efficiency")
             self.mlm_efficiency_path = self._get_full_mlm_efficiency_path(split)
             os.makedirs(self.mlm_efficiency_path, exist_ok=append_mlm_efficiency)
+            self.use_mlm_efficiency_frequency = use_mlm_efficiency_frequency
 
     def _get_full_mlm_efficiency_path(self, split: str) -> str:
         if self.mlm_efficiency_path is None:
@@ -847,7 +850,14 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
                         end_index = max(result["offsets_mapping_ends"])
                         assert end_index - start_index <= len(sample['text'])
                         assert end_index - start_index >= 0
-                        mlm_probs = f[str(shard_sample_id)][start_index:end_index]
+                        
+                        use_mlm_efficiency = random.random() < self.use_mlm_efficiency_frequency
+                        print (f"------>>>>>use_mlm_efficiency = {use_mlm_efficiency}") # debug
+                        if use_mlm_efficiency:
+                            mlm_probs = f[str(shard_sample_id)][start_index:end_index]
+                        else:
+                            mlm_probs = np.ones(end_index - start_index, dtype=self.MLM_PROB_DTYPE)
+
                         mlm_probs = np.nan_to_num(mlm_probs, nan=1.0, copy=False) # probability=1.0 for unseen positions
                         # mlm_probs are stored in base-pair resolution, so we need to convert them to bpe-token resolution according to offsets_mapping
                         mlm_probs_list = []
