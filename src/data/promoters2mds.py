@@ -2,6 +2,10 @@
 # conda activate bert24
 # split="valid"; python promoters2mds.py --json_folder /mnt/nfs_dna/shadskiy/promoters/pretrena/$split/ --out_dir /mnt/nfs_dna/shadskiy/promoters/pretrena/mds_v2/ --split_name $split --overwrite
 
+# small 100 lines test:
+# head -100 /mnt/nfs_dna/shadskiy/promoters/pretrena/train/GCF_000001405.40/GCF_000001405.40.jsonl >  /mnt/nfs_dna/minja/DNALM/promoter_pretrain/small_test_100_human_promoters/jsons/GCF_000001405.40/GCF_000001405.40.jsonl
+# python3 src/data/promoters2mds.py --json_folder /mnt/nfs_dna/minja/DNALM/promoter_pretrain/small_test_100_human_promoters/jsons/ --out_dir /mnt/nfs_dna/minja/DNALM/promoter_pretrain/small_test_100_human_promoters/mds/ --split_name train --overwrite
+
 import argparse
 import json
 import os
@@ -62,6 +66,7 @@ def process_files(args):
         "text": "str",
         "file_id": "str",
         "line_id": "int",
+        "chunk_offset": "int",
     }
 
     with MDSWriter(columns=columns, out=full_out_dir, size_limit='64mb') as fout:
@@ -80,7 +85,8 @@ def process_files(args):
                             sample = {
                                 'text': str(chunk).upper(),
                                 'file_id': file.split('.')[0],
-                                'line_id': line_id
+                                'line_id': line_id,
+                                'chunk_offset': i,
                             }
                             fout.write(sample)
                             chunks_lengths.append(len(chunk))

@@ -1,6 +1,7 @@
 # Run like this:
 # conda activate bert24
 # python3 compute_MLM_metrics.py --model_path ~/DNALM/ModernBERT/runs/moderngena-base-pretrain-promoters_multi/ --data_dir /mnt/nfs_dna/minja/DNALM/promoter_pretrain/ --split valid --max_seq_len 1024 --output_file human.100samples.json # --log_level DEBUG
+# python3 compute_MLM_metrics.py --model_path ~/DNALM/ModernBERT/runs/moderngena-base-pretrain-promoters_multi/ --data_dir /mnt/nfs_dna/minja/DNALM/promoter_pretrain/small_test_100_human_promoters/mds/  --split train  --max_seq_len 1024 --output_file human.100samples.json --N all
 
 import os
 import argparse
@@ -100,6 +101,7 @@ class NoStreamingGenomeDatasetAndDataloader(NoStreamingDataset):
 				'text': text,
 				'file_id': text_sample['file_id'],
 				'line_id': text_sample['line_id'],
+				'line_chunk_offset': text_sample['chunk_offset']
 			}]
 		
 		# Split into chunks of meaningful_seq_len
@@ -120,7 +122,9 @@ class NoStreamingGenomeDatasetAndDataloader(NoStreamingDataset):
 				'text': text,
 				'file_id': text_sample['file_id'],
 				'line_id': text_sample['line_id'],
+				'line_chunk_offset': text_sample['chunk_offset']
 			})
+			print (chunk_offset_mapping[-1])
 		
 		return chunks
 
@@ -229,16 +233,17 @@ def process_batch(model, tokenizer, batch, mlm_probability, output_file):
 	# Process each sequence in the batch
 	for i in range(len(batch)):
 		# Process sequence
-		return process_sequence_chunk(
+		yield process_sequence_chunk(
 			model, tokenizer,
 			batch[i]['input_ids'], 
 			batch[i]['attention_mask'], 
 			batch[i]['offset_mapping'],
 			batch[i]['file_id'],
 			batch[i]['line_id'],
+			batch[i]['line_chunk_offset'],
 			mlm_probability, output_file)
 
-def process_sequence_chunk(model, tokenizer, input_ids, attention_mask, offset_mapping, file_id, line_id, mlm_probability, output_file):
+def process_sequence_chunk(model, tokenizer, input_ids, attention_mask, offset_mapping, file_id, line_id, line_chunk_offset, mlm_probability, output_file):
 	# Convert inputs to tensors if they aren't already
 	if not isinstance(input_ids, torch.Tensor):
 		input_ids = torch.tensor(input_ids)
@@ -271,7 +276,7 @@ def process_sequence_chunk(model, tokenizer, input_ids, attention_mask, offset_m
 	# Process each offset pattern
 	all_masked_positions = [] # for checking if all positions were masked
 	overall_tokens_accuracy = []
-	logger.debug(f"Processing chunk {file_id} {line_id} {chunk_start} {chunk_end}")
+	logger.debug(f"Processing chunk {file_id} {line_id} {line_chunk_offset} {chunk_start} {chunk_end}")
 	for offset in range(n_offset_patterns):
 		logger.debug(f"Processing offset {offset}")
 		# Store ground truth tokens for masked positions
@@ -349,6 +354,7 @@ def process_sequence_chunk(model, tokenizer, input_ids, attention_mask, offset_m
 	output_file.write(json.dumps({
 		"file_id": file_id,
 		"line_id": line_id,
+		"line_chunk_offset": line_chunk_offset,
 		"chunk_start": chunk_start,
 		"chunk_end": chunk_end,
 		"probabilities": chunk_probs.tolist(),
@@ -375,6 +381,8 @@ def main():
 	parser.add_argument("--mlm_probability", type=float, default=0.3, help="Probability of masking tokens")
 	parser.add_argument("--output_file", type=str, required=True, help="Output file path")
 	parser.add_argument("--log_level", type=str, default="INFO", help="Logging level")
+	parser.add_argument("--human", action="store_true", help="Process human data")
+	parser.add_argument("--N", default=5000, help="Number of samples to process")
 	args = parser.parse_args()
 
 	# Set logging level
@@ -399,12 +407,15 @@ def main():
 	
 	# Process sequences
 	processed = 0
-	N_to_process = 5000
+	if str(args.N) == "all":
+		N_to_process = len(batched_dataset)
+	else:
+		N_to_process = int(args.N)
 	# create progress bar
 	progress_bar = tqdm(total=N_to_process, desc="Processing batches")
 	nucleotide_accuracy = []
 	token_accuracy = []
-	human = False
+	human = args.human
 	randomize = True
 
 	assert not human or not randomize, "Cannot process human data and randomize at the same time"
@@ -428,15 +439,15 @@ def main():
 				logger.debug(f"Skipping batch {batch[0]['file_id']}")
 				continue
 			logger.debug(f"Processing batch {batch_id}")
-			results = process_batch(
+			results = list(process_batch(
 				model, 
 				tokenizer,
 				batch,
 				args.mlm_probability,
 				f,
-			)
-			nucleotide_accuracy.append(results["nucleotide_accuracy"])
-			token_accuracy.append(results["token_accuracy"])
+			))
+			nucleotide_accuracy.extend([r["nucleotide_accuracy"] for r in results])
+			token_accuracy.extend([r["token_accuracy"] for r in results])
 			progress_bar.update(1)
 			logger.debug(f"Done processing batch {processed}")			
 			processed += 1
