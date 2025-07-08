@@ -736,6 +736,27 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         self.sample_chunk = sample_chunk
         self.min_seq_len = min_seq_len
         self.mlm_efficiency_path = mlm_efficiency_path
+
+        # get mean token length for tokenizer
+        tokens = self.tokenizer.get_vocab()
+
+        try:
+            all_special_tokens = self.tokenizer.special_tokens_map["additional_special_tokens"]
+        except KeyError:
+            all_special_tokens = []
+
+        for k,v in self.tokenizer.special_tokens_map.items():
+            if k != "additional_special_tokens":
+                all_special_tokens.append(v)
+                assert isinstance(v, str), f"Special token {v} is not a string"
+        
+        # exclude special tokens
+        tokens = {k: v for k, v in tokens.items() if k not in all_special_tokens}
+
+        token_lengths = [len(token) for token in tokens.keys()]
+        self.mean_token_length = sum(token_lengths) / len(token_lengths)
+        # print (f"Mean token length: {self.mean_token_length}") # debug
+    
         if self.mlm_efficiency_path is not None:
             if split is None:
                 raise ValueError("Split is required to save mlm efficiency")
@@ -761,7 +782,7 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
             # todo: do we really want uniform length sampling here?
             max_seq_len = random.randint(self.min_seq_len, self.max_seq_len)
             # choose start index somewhere in the first half
-            st_index = random.randint(0, len(text) // 2)
+            st_index = random.randint(0, max(1, len(text) - int(self.mean_token_length*max_seq_len*1.1))) # 1.1 is a safety factor
 
         text = text[st_index:]
         text = text[:max_seq_len * 10]  # cut to make tokenization faster if text is too long
