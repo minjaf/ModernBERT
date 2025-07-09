@@ -852,33 +852,33 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
                         assert end_index - start_index >= 0
                         
                         use_mlm_efficiency = random.random() < self.use_mlm_efficiency_frequency
-                        print (f"------>>>>>use_mlm_efficiency = {use_mlm_efficiency}") # debug
+                        # print (f"------>>>>>use_mlm_efficiency = {use_mlm_efficiency}") # debug
                         if use_mlm_efficiency:
                             mlm_probs = f[str(shard_sample_id)][start_index:end_index]
                         else:
                             mlm_probs = np.ones(end_index - start_index, dtype=self.MLM_PROB_DTYPE)
 
-                        mlm_probs = np.nan_to_num(mlm_probs, nan=1.0, copy=False) # probability=1.0 for unseen positions
-                        # mlm_probs are stored in base-pair resolution, so we need to convert them to bpe-token resolution according to offsets_mapping
-                        mlm_probs_list = []
-                        non_pad_MLM_probs = []
-                        for tok_start,tok_end in zip(result["offsets_mapping_starts"], result["offsets_mapping_ends"]):
-                            if tok_end - tok_start == 0: # service tokens and padding
-                                mlm_probs_list.append(0.)
-                            elif tok_end - tok_start > 0:
-                                mlm_probs_list.append(np.mean(mlm_probs[tok_start-start_index:tok_end-start_index]))
-                                non_pad_MLM_probs.append(np.mean(mlm_probs[tok_start-start_index:tok_end-start_index]))
-                            else:
-                                raise ValueError(f"tok_end - tok_start = {tok_end - tok_start} is negative")
-                        if len(non_pad_MLM_probs) > 0:
-                            result["mean_non_pad_MLM_probs"] = np.mean(non_pad_MLM_probs)
-                        else:
-                            raise ValueError("No mlm probs found")
-                        assert len(mlm_probs_list) == len(result["input_ids"]), "MLM probs and input ids have different lengths"
-                        result["MLM_probs"] = mlm_probs_list
-                        # propagate shard id and shard sample id to save MLM probs after we get it
-                        result["shard_id"] = [shard_id]
-                        result["shard_sample_id"] = [shard_sample_id]
+                mlm_probs = np.nan_to_num(mlm_probs, nan=1.0, copy=False) # probability=1.0 for unseen positions
+                # mlm_probs are stored in base-pair resolution, so we need to convert them to bpe-token resolution according to offsets_mapping
+                mlm_probs_list = []
+                non_pad_MLM_probs = []
+                for tok_start,tok_end in zip(result["offsets_mapping_starts"], result["offsets_mapping_ends"]):
+                    if tok_end - tok_start == 0: # service tokens and padding
+                        mlm_probs_list.append(0.)
+                    elif tok_end - tok_start > 0:
+                        mlm_probs_list.append(np.mean(mlm_probs[tok_start-start_index:tok_end-start_index]))
+                        non_pad_MLM_probs.append(np.mean(mlm_probs[tok_start-start_index:tok_end-start_index]))
+                    else:
+                        raise ValueError(f"tok_end - tok_start = {tok_end - tok_start} is negative")
+                if len(non_pad_MLM_probs) > 0:
+                    result["mean_non_pad_MLM_probs"] = np.mean(non_pad_MLM_probs)
+                else:
+                    raise ValueError("No mlm probs found")
+                assert len(mlm_probs_list) == len(result["input_ids"]), "MLM probs and input ids have different lengths"
+                result["MLM_probs"] = mlm_probs_list
+                # propagate shard id and shard sample id to save MLM probs after we get it
+                result["shard_id"] = [shard_id]
+                result["shard_sample_id"] = [shard_sample_id]
                 # print ("Done") # debug
             return result
         else:
