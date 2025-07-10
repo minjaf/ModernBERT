@@ -32,6 +32,7 @@ from torchmetrics import MeanSquaredError, Metric
 from torchmetrics.classification.accuracy import MulticlassAccuracy, MultilabelAccuracy
 from torchmetrics.classification.matthews_corrcoef import MatthewsCorrCoef
 from torchmetrics.regression.spearman import SpearmanCorrCoef
+from torchmetrics.utilities import dim_zero_cat
 
 from filelock import FileLock
 import h5py
@@ -155,14 +156,14 @@ class bpLoss(Metric):
     def __init__(self, dist_sync_on_step: bool = False, filepath: str | None = None, 
             write2file_threshold: float = 0.0):
         super().__init__(dist_sync_on_step=dist_sync_on_step)
-        self.add_state("true_probs", default=[], dist_reduce_fx=None)
-        self.add_state("offset_starts", default=[], dist_reduce_fx=None)
-        self.add_state("offset_ends", default=[], dist_reduce_fx=None)        
-        self.add_state("shard_sample_ids", default=[], dist_reduce_fx=None)
-        self.add_state("shard_ids", default=[], dist_reduce_fx=None)
-        self.add_state("num_repeats", default=[], dist_reduce_fx=None)
+        self.add_state("true_probs", default=[], dist_reduce_fx="cat")
+        self.add_state("offset_starts", default=[], dist_reduce_fx="cat")
+        self.add_state("offset_ends", default=[], dist_reduce_fx="cat")        
+        self.add_state("shard_sample_ids", default=[], dist_reduce_fx="cat")
+        self.add_state("shard_ids", default=[], dist_reduce_fx="cat")
+        self.add_state("num_repeats", default=[], dist_reduce_fx="cat")
         self.add_state("N_toks_processed", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("mean_non_pad_MLM_probs", default=[], dist_reduce_fx="mean")
+        self.add_state("mean_non_pad_MLM_probs", default=[], dist_reduce_fx="cat")
         self.filepath = filepath
         self.write2file_threshold = write2file_threshold
 
@@ -280,13 +281,13 @@ class bpLoss(Metric):
         """Aggregate the state over all processes to compute the metric.
         """
         # convert to tensors and concatenate
-        true_probs = torch.cat(self.true_probs, dim=0)
-        offset_starts = torch.cat(self.offset_starts, dim=0)
-        offset_ends = torch.cat(self.offset_ends, dim=0)
-        shard_sample_ids = torch.cat(self.shard_sample_ids, dim=0)
-        shard_ids = torch.cat(self.shard_ids, dim=0)
-        num_repeats = torch.cat(self.num_repeats, dim=0)
-        mean_non_pad_MLM_probs = torch.cat(self.mean_non_pad_MLM_probs, dim=0)
+        true_probs = dim_zero_cat(self.true_probs)
+        offset_starts = dim_zero_cat(self.offset_starts)
+        offset_ends = dim_zero_cat(self.offset_ends)
+        shard_sample_ids = dim_zero_cat(self.shard_sample_ids)
+        shard_ids = dim_zero_cat(self.shard_ids)
+        num_repeats = dim_zero_cat(self.num_repeats)
+        mean_non_pad_MLM_probs = dim_zero_cat(self.mean_non_pad_MLM_probs)
 
         self._to_file(true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats)
         # return self.N_toks_processed.item()

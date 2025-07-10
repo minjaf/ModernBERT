@@ -1,5 +1,5 @@
 # data_local: ./human_t2t_1k
-data_local: /mnt/nfs_dna/shadskiy/promoters/pretrena/mds_v2/
+data_local: /home/jovyan/DNALM/data/mds_v2/
 data_remote: # If blank, files must be present in data_local
 
 max_seq_len: 1024
@@ -8,7 +8,7 @@ mlm_probability: 0.3 # FlexBERT should use 30% masking for optimal performance
 count_padding_tokens: false
 
 # Run Name
-run_name: moderngena-base-pretrain-promoters_multi_v2_amlm
+run_name: moderngena-base-pretrain-promoters_multi_v2_amlm_0.6
 
 # checkpoint
 init_from_checkpoint:
@@ -87,7 +87,7 @@ train_loader:
     streaming: false
     mlm_efficiency_path: runs/mlm_efficiency/mds_v2/
     append_mlm_efficiency: true
-    use_mlm_efficiency_frequency: 0.5
+    use_mlm_efficiency_frequency: 0.6
   drop_last: true
   num_workers: 6
   prefetch_factor: 2
@@ -133,7 +133,7 @@ optimizer:
   log_grad_norm: true
 
 max_duration: 1_719_000_000_000tok
-eval_interval: 2000ba
+eval_interval: 1000ba
 eval_subset_num_batches: 200
 global_train_batch_size: 4608
 global_eval_batch_size: 1024
