@@ -12,6 +12,9 @@ import copy
 import os
 import sys
 from typing import Any, Dict, Optional
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
 
 import torch
 from torch import Tensor
@@ -146,6 +149,45 @@ class EfficientZLoss(Metric):
         # Return average loss over entire dataset
         return self.sum_loss / self.total_items  # type: ignore (third-party)
 
+def _write_sample_to_file(sample_data, f, write2file_threshold):
+    """Write a single sample to its corresponding file using thread-safe operations."""
+    shard_sample_id, num_repeat, start_idx, end_idx, true_probs, offset_starts, offset_ends, shard_id = sample_data
+    if num_repeat == 0:
+        return
+        
+    max_probability = true_probs[start_idx:end_idx].max()
+    
+    # skip if max probability of all tokens in the sample is less than write2file_threshold
+    if max_probability < write2file_threshold:
+        return
+
+    assert str(shard_sample_id) in f, f"shard_sample_id {shard_sample_id} not found in {f.filename}"
+    data = f[str(shard_sample_id)][:]  # read all data
+    for i in range(num_repeat):
+        token_idx = start_idx + i
+        # update only if true prob is > write2file_threshold to save time
+        if true_probs[token_idx] > write2file_threshold:
+            st = offset_starts[token_idx]
+            en = offset_ends[token_idx]
+            data[st:en] = 1. - true_probs[token_idx]  # update in memory
+    f[str(shard_sample_id)][:] = data  # single write operation
+
+def _write_samples_from_same_h5_to_file_single_thread(samples, write2file_threshold, filepath):
+    shard_id = [sample[-1] for sample in samples]
+    assert len(set(shard_id)) == 1, "shard_sample_ids must be the same for all samples"
+    shard_id = shard_id[0]
+    save_path = os.path.join(filepath, f"shard_{shard_id}.hdf5")
+    timestamp = datetime.datetime.now()
+    with FileLock(save_path + ".lock"):
+        with h5py.File(save_path, "a") as f:
+            timedelta_opening_file = datetime.datetime.now() - timestamp
+            timestamp = datetime.datetime.now()
+            for sample in samples:
+                _write_sample_to_file(sample, f, write2file_threshold)
+            timedelta_writing_to_file = datetime.datetime.now() - timestamp
+    return timedelta_opening_file, timedelta_writing_to_file
+
+
 class bpLoss(Metric):
     """Torchmetric that grabs the per-sample per-token loss"""
 
@@ -154,7 +196,7 @@ class bpLoss(Metric):
 
 
     def __init__(self, dist_sync_on_step: bool = False, filepath: str | None = None, 
-            write2file_threshold: float = 0.0):
+            write2file_threshold: float = 0.0, n_threads: int = 1):
         super().__init__(dist_sync_on_step=dist_sync_on_step)
         self.add_state("true_probs", default=[], dist_reduce_fx="cat")
         self.add_state("offset_starts", default=[], dist_reduce_fx="cat")
@@ -166,6 +208,7 @@ class bpLoss(Metric):
         self.add_state("mean_non_pad_MLM_probs", default=[], dist_reduce_fx="cat")
         self.filepath = filepath
         self.write2file_threshold = write2file_threshold
+        self.n_threads = n_threads
 
     def update(self, logits: Tensor, labels_reduced: Tensor, labels_full: Tensor, batch: dict) -> None:
         """Updates the internal state with results from a new batch.
@@ -193,15 +236,15 @@ class bpLoss(Metric):
         assert torch.all(offset_ends - offset_starts > 0), "offset_ends must be greater than offset_starts"
         assert torch.allclose(batch["shard_sample_id"].min(dim=1)[0], batch["shard_sample_id"].max(dim=1)[0]), "shard_sample_id must be unique value per sample in batch"
         num_repeats = mask.sum(dim=1)
-        if num_repeats.min() == 0:
-            print("Example of batch where num_repeats == 0:")
-            print(f"num_repeats: {num_repeats}")
-            print(f"labels_full shape: {labels_full.shape}")
-            print(f"mask shape: {mask.shape}")
-            print(f"mask sum per sample: {mask.sum(dim=1)}")
-            print(f"labels_full sample: {labels_full[0] if labels_full.size(0) > 0 else 'empty'}")
-            print(f"mask sample: {mask[0] if mask.size(0) > 0 else 'empty'}")
-            print("This indicates some samples have no masked tokens to predict")
+        # if num_repeats.min() == 0:
+        #     print("Example of batch where num_repeats == 0:")
+        #     print(f"num_repeats: {num_repeats}")
+        #     print(f"labels_full shape: {labels_full.shape}")
+        #     print(f"mask shape: {mask.shape}")
+        #     print(f"mask sum per sample: {mask.sum(dim=1)}")
+        #     print(f"labels_full sample: {labels_full[0] if labels_full.size(0) > 0 else 'empty'}")
+        #     print(f"mask sample: {mask[0] if mask.size(0) > 0 else 'empty'}")
+        #     print("This indicates some samples have no masked tokens to predict")
         shard_sample_ids = batch["shard_sample_id"].flatten()
         shard_ids = batch["shard_id"].flatten()
         save_paths = batch["mlm_efficiency_path"]
@@ -225,10 +268,9 @@ class bpLoss(Metric):
         self.num_repeats.append(num_repeats)
         self.N_toks_processed += true_probs.size()[0]
         self.mean_non_pad_MLM_probs.append(batch["mean_non_pad_MLM_probs"])
+        self._to_file(true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats)
 
-    def _to_file(self, true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats):
-        idx_of_sample_in_batch = 0
-        idx_of_token_in_concatenated_batch = 0
+    def _to_file(self, true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats):        
         # convert to numpy
         true_probs = true_probs.cpu().numpy()
         offset_starts = offset_starts.cpu().numpy()
@@ -237,45 +279,76 @@ class bpLoss(Metric):
         shard_ids = shard_ids.cpu().numpy()
         num_repeats = num_repeats.cpu().numpy()
 
-        timedelta_opening_file = datetime.timedelta(0)
-        timedelta_writing_to_file = datetime.timedelta(0)
-
-        while idx_of_sample_in_batch < len(shard_sample_ids):
+        # Prepare sample data for processing
+        sample_data_dict = {}
+        idx_of_token_in_concatenated_batch = 0
+        
+        for idx_of_sample_in_batch in range(len(shard_sample_ids)):
             shard_sample_id = shard_sample_ids[idx_of_sample_in_batch]
             num_repeat = num_repeats[idx_of_sample_in_batch]
-            if num_repeat == 0:
-                idx_of_sample_in_batch += 1
-                continue
-            save_path = os.path.join(self.filepath, f"shard_{shard_ids[idx_of_sample_in_batch]}.hdf5")
-            max_probability = true_probs[idx_of_token_in_concatenated_batch:idx_of_token_in_concatenated_batch+num_repeat].max()
+            shard_id = shard_ids[idx_of_sample_in_batch]
             
-            # skip if max probability of all tokens in the sample is less than write2file_threshold
-            if max_probability < self.write2file_threshold:
-                idx_of_token_in_concatenated_batch += num_repeat
-                idx_of_sample_in_batch += 1
+            if num_repeat == 0:
                 continue
-
-            timestamp = datetime.datetime.now()
-            with FileLock(save_path+".lock"):
-                with h5py.File(save_path, "a") as f:
-                    timedelta_opening_file += datetime.datetime.now() - timestamp
-                    timestamp = datetime.datetime.now()
-                    assert str(shard_sample_id) in f, f"shard_sample_id {shard_sample_id} not found in {save_path}"
-                    data = f[str(shard_sample_id)][:] # read all data
-                    for i in range(num_repeat):
-                        # update only if true prob is > write2file_threshold to save time
-                        if true_probs[idx_of_token_in_concatenated_batch] > self.write2file_threshold:
-                            st = offset_starts[idx_of_token_in_concatenated_batch]
-                            en = offset_ends[idx_of_token_in_concatenated_batch]
-                            data[st:en] = 1. - true_probs[idx_of_token_in_concatenated_batch] # update in memory
-                            # f[str(shard_sample_id)][st:en] = 1. - true_probs[idx_of_token_in_concatenated_batch]
-                        idx_of_token_in_concatenated_batch += 1
-                    f[str(shard_sample_id)][:] = data # single write operation
-                    timedelta_writing_to_file += datetime.datetime.now() - timestamp
-            idx_of_sample_in_batch += 1
+                
+            start_idx = idx_of_token_in_concatenated_batch
+            end_idx = idx_of_token_in_concatenated_batch + num_repeat
+            
+            sample_data = (
+                shard_sample_id, num_repeat, start_idx, end_idx,
+                true_probs, offset_starts, offset_ends, shard_id
+            )
+            if shard_id not in sample_data_dict:
+                sample_data_dict[shard_id] = []
+            sample_data_dict[shard_id].append(sample_data)
+            
+            idx_of_token_in_concatenated_batch += num_repeat
+            
         assert idx_of_token_in_concatenated_batch == true_probs.shape[0], "idx_of_token_in_concatenated_batch does not match the number of true probabilities"
-        # print ("---->timedelta_opening_file = ", timedelta_opening_file.total_seconds() * 1000)
-        # print ("---->timedelta_writing_to_file = ", timedelta_writing_to_file.total_seconds() * 1000)
+
+        total_timedelta_opening_file = datetime.timedelta(0)
+        total_timedelta_writing_to_file = datetime.timedelta(0)
+        wall_time = datetime.datetime.now()
+        
+        # print(f"Total number of samples: {len(shard_ids)}, number of shards: {len(sample_data_dict)}")
+        
+        if self.n_threads <= 1:
+            # Use optimized single-threaded approach for I/O bottleneck scenarios
+            print("Using optimized single-threaded I/O approach")
+            for shard_id, samples in sample_data_dict.items():
+                result = _write_samples_from_same_h5_to_file_single_thread(samples, 
+                                                                            self.write2file_threshold, 
+                                                                            self.filepath,
+                                                                        )
+                if result is not None:
+                    timedelta_opening_file, timedelta_writing_to_file = result
+                    total_timedelta_opening_file += timedelta_opening_file
+                    total_timedelta_writing_to_file += timedelta_writing_to_file
+        else:
+            # Use multithreading for CPU-bound scenarios
+            max_workers = min(self.n_threads, len(sample_data_dict))
+            print(f"Using {max_workers} threads for multithreaded approach")
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks
+                future_to_sample = {
+                    executor.submit(_write_samples_from_same_h5_to_file_single_thread, 
+                    sample_data_dict[shard_id], self.write2file_threshold, self.filepath): shard_id
+                    for shard_id in sample_data_dict.keys()
+                }
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_sample):
+                    result = future.result()
+                    if result is not None:
+                        timedelta_opening_file, timedelta_writing_to_file = result
+                        total_timedelta_opening_file += timedelta_opening_file
+                        total_timedelta_writing_to_file += timedelta_writing_to_file
+        
+        wall_time = datetime.datetime.now() - wall_time
+        # print("---->timedelta_opening_file = ", total_timedelta_opening_file.total_seconds() * 1000, "ms")
+        # print("---->timedelta_writing_to_file = ", total_timedelta_writing_to_file.total_seconds() * 1000, "ms")
+        # print("---->wall_time = ", wall_time.total_seconds() * 1000, "ms")
 
     def compute(self):
         """Aggregate the state over all processes to compute the metric.
@@ -289,7 +362,7 @@ class bpLoss(Metric):
         num_repeats = dim_zero_cat(self.num_repeats)
         mean_non_pad_MLM_probs = dim_zero_cat(self.mean_non_pad_MLM_probs)
 
-        self._to_file(true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats)
+        # self._to_file(true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats)
         # return self.N_toks_processed.item()
         return mean_non_pad_MLM_probs.mean().item()
         # TODO. Should we reset the state? Let's belive trainer will do it for us
