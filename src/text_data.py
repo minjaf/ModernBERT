@@ -773,6 +773,8 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
 
     def _tokenize(self, text_sample):
         assert self.tokenizer is not None, "Tokenizer required if data is not pretokenized"
+        if not hasattr(self.tokenizer, "_pad_token"):
+            self.tokenizer._pad_token = self.tokenizer.pad_token_id
         if self.tokenizer._pad_token is None:
             # Some tokenizers (e.g. GPT2 tokenizer) have no padding token which causes bugs
             raise RuntimeError("If tokenizing on-the-fly, tokenizer must have a pad_token_id")
