@@ -9,6 +9,9 @@ count_padding_tokens: false
 # Run Name
 run_name: moderngena-large-pretrain-promoters_multi_v2
 
+autoresume: true
+save_overwrite: true # requiered to overwrite last cpt
+
 # Model
 model:
   name: flex_bert
@@ -157,7 +160,7 @@ loggers:
     log_dir: runs/ # will log to log_dir/run_name
 
 # Checkpoint to local filesystem or remote object store
-save_interval: 100ba
+save_interval: 200ba
 save_num_checkpoints_to_keep: 5  # Important, this cleans up checkpoints saved to DISK
 save_folder: runs/{run_name}
 
