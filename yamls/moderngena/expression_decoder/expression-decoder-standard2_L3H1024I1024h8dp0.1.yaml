@@ -39,7 +39,7 @@ model:
     hidden_size: 1024 # to match hidden size of DNA+ct embedding
     intermediate_size: 1024
     num_attention_heads: 8
-    attention_layer: parallel # options here are: {
+    attention_layer: base # options here are: {
 #     "unpadded_base": FlexBertUnpadAttention,
 #     "padded_base": FlexBertPaddedAttention,
 #     "unpadded_parallel": FlexBertUnpadParallelAttention,
