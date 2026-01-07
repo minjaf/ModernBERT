@@ -149,7 +149,7 @@ class EfficientZLoss(Metric):
         # Return average loss over entire dataset
         return self.sum_loss / self.total_items  # type: ignore (third-party)
 
-def _write_sample_to_file(sample_data, f, write2file_threshold):
+def _write_sample_to_file(sample_data, f, metric_to_save, write2file_threshold):
     """Write a single sample to its corresponding file using thread-safe operations."""
     shard_sample_id, num_repeat, start_idx, end_idx, true_probs, offset_starts, offset_ends, shard_id = sample_data
     if num_repeat == 0:
@@ -158,10 +158,10 @@ def _write_sample_to_file(sample_data, f, write2file_threshold):
     max_probability = true_probs[start_idx:end_idx].max()
     
     # skip if max probability of all tokens in the sample is less than write2file_threshold
-    if max_probability < write2file_threshold:
+    if max_probability < write2file_threshold or write2file_threshold == 0.0: # in case true probs are bool
         return
 
-    assert str(shard_sample_id) in f, f"shard_sample_id {shard_sample_id} not found in {f.filename}"
+    assert str(shard_sample_id) in f, f"shard_sample_id {shard_sample_id} not found in {f.filename}. Available keys: {list(f.keys())}"
     data = f[str(shard_sample_id)][:]  # read all data
     for i in range(num_repeat):
         token_idx = start_idx + i
@@ -169,10 +169,15 @@ def _write_sample_to_file(sample_data, f, write2file_threshold):
         if true_probs[token_idx] > write2file_threshold:
             st = offset_starts[token_idx]
             en = offset_ends[token_idx]
-            data[st:en] = 1. - true_probs[token_idx]  # update in memory
+            if metric_to_save == "is_correct":
+                data[st:en] = true_probs[token_idx]
+            elif metric_to_save == "probability":
+                data[st:en] = 1. - true_probs[token_idx]  # update in memory
+            else:
+                raise ValueError(f"Invalid metric_to_save: {metric_to_save}")
     f[str(shard_sample_id)][:] = data  # single write operation
 
-def _write_samples_from_same_h5_to_file_single_thread(samples, write2file_threshold, filepath):
+def _write_samples_from_same_h5_to_file_single_thread(samples, metric_to_save, write2file_threshold, filepath):
     shard_id = [sample[-1] for sample in samples]
     assert len(set(shard_id)) == 1, "shard_sample_ids must be the same for all samples"
     shard_id = shard_id[0]
@@ -183,7 +188,7 @@ def _write_samples_from_same_h5_to_file_single_thread(samples, write2file_thresh
             timedelta_opening_file = datetime.datetime.now() - timestamp
             timestamp = datetime.datetime.now()
             for sample in samples:
-                _write_sample_to_file(sample, f, write2file_threshold)
+                _write_sample_to_file(sample, f, metric_to_save, write2file_threshold)
             timedelta_writing_to_file = datetime.datetime.now() - timestamp
     return timedelta_opening_file, timedelta_writing_to_file
 
@@ -195,18 +200,23 @@ class bpLoss(Metric):
     full_state_update = False
 
 
-    def __init__(self, dist_sync_on_step: bool = False, filepath: str | None = None, 
+    def __init__(self, dist_sync_on_step: bool = False, filepath: str | None = None,
+            metric_to_save : str = "probability", # or "is_correct",
+            metric_to_return : str = "mean_non_pad_MLM_probs", # or "mean_is_correct",
             write2file_threshold: float = 0.0, n_threads: int = 1):
         super().__init__(dist_sync_on_step=dist_sync_on_step)
-        self.add_state("true_probs", default=[], dist_reduce_fx="cat")
-        self.add_state("offset_starts", default=[], dist_reduce_fx="cat")
-        self.add_state("offset_ends", default=[], dist_reduce_fx="cat")        
-        self.add_state("shard_sample_ids", default=[], dist_reduce_fx="cat")
-        self.add_state("shard_ids", default=[], dist_reduce_fx="cat")
-        self.add_state("num_repeats", default=[], dist_reduce_fx="cat")
+        # self.add_state("true_probs", default=[], dist_reduce_fx="cat")
+        # self.add_state("offset_starts", default=[], dist_reduce_fx="cat")
+        # self.add_state("offset_ends", default=[], dist_reduce_fx="cat")        
+        # self.add_state("shard_sample_ids", default=[], dist_reduce_fx="cat")
+        # self.add_state("shard_ids", default=[], dist_reduce_fx="cat")
+        # self.add_state("num_repeats", default=[], dist_reduce_fx="cat")
         self.add_state("N_toks_processed", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("mean_non_pad_MLM_probs", default=[], dist_reduce_fx="cat")
+        self.add_state("N_correct_tokens", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("return_metric", default=[], dist_reduce_fx="cat")
         self.filepath = filepath
+        self.metric_to_save = metric_to_save
+        self.metric_to_return = metric_to_return
         self.write2file_threshold = write2file_threshold
         self.n_threads = n_threads
 
@@ -222,14 +232,27 @@ class bpLoss(Metric):
         assert len(labels_full.size()) == len(batch["shard_id"].size()) == len(batch["shard_sample_id"].size()) == len(batch["offsets_mapping_starts"].size()) == len(batch["offsets_mapping_ends"].size()) == 2, "labels_full, shard_id, shard_sample_id, offsets_mapping_starts and offsets_mapping_ends must be a 2D tensor"
         assert logits.size()[0] == labels_reduced.size()[0], "logits and labels_reduced have different batch sizes"
         mask = labels_full != -100
-        logits = torch.softmax(logits, dim=1)
-        # logits is N_masked x V
-        # labels is N_masked
-        # Get the probability for each true token
-        true_probs = torch.gather(logits, dim=1, index=labels_reduced.unsqueeze(1)).squeeze(1)
-        # print ("------>Mean of true_probs: ", true_probs.mean().item())
-        # print ("------>Max of true_probs: ", true_probs.max().item())
-        # print ("------>N of true_probs > self.write2file_threshold: ", (true_probs > self.write2file_threshold).sum().item(), " out of ", true_probs.size()[0])
+        # print ("labels_reduced: ", labels_reduced.size()) # size: N_masked
+        # print ("logits: ", logits.size()) # size: N_masked x V
+        # print ("labels_full: ", labels_full.size()) # size: B x S
+        # print ("input_ids: ", batch["input_ids"].size()) # size: B x S
+
+        if self.metric_to_save == "is_correct":
+            highest_probability_index = logits.argmax(dim=1)
+            assert highest_probability_index.size() == labels_reduced.size(), "highest_probability_index and labels_reduced have different sizes"
+            is_correct = highest_probability_index == labels_reduced
+            true_probs = is_correct # just for naming convention, actually these are not probabilities
+        elif self.metric_to_save == "probability":            
+            logits = torch.softmax(logits, dim=1)
+            # logits is N_masked x V
+            # labels is N_masked
+            # Get the probability for each true token
+            true_probs = torch.gather(logits, dim=1, index=labels_reduced.unsqueeze(1)).squeeze(1)
+            # print ("------>Mean of true_probs: ", true_probs.mean().item())
+            # print ("------>Max of true_probs: ", true_probs.max().item())
+            # print ("------>N of true_probs > self.write2file_threshold: ", (true_probs > self.write2file_threshold).sum().item(), " out of ", true_probs.size()[0])
+        else:
+            raise ValueError(f"Invalid metric_to_save: {self.metric_to_save}")
 
         offset_starts = batch["offsets_mapping_starts"][mask]
         offset_ends = batch["offsets_mapping_ends"][mask]
@@ -255,19 +278,24 @@ class bpLoss(Metric):
         assert len(num_repeats) == len(shard_sample_ids) == len(shard_ids) == len(save_paths), "num_repeats, shard_sample_ids, shard_ids and save_paths must have the same length"
         assert sum(num_repeats) == true_probs.size()[0], "num_repeats does not match the number of true probabilities"
 
-        self.true_probs.append(true_probs)
-        self.offset_starts.append(offset_starts)
-        self.offset_ends.append(offset_ends)
-        self.shard_sample_ids.append(shard_sample_ids)
-        self.shard_ids.append(shard_ids)
+        # self.true_probs.append(true_probs)
+        # self.offset_starts.append(offset_starts)
+        # self.offset_ends.append(offset_ends)
+        # self.shard_sample_ids.append(shard_sample_ids)
+        # self.shard_ids.append(shard_ids)
         assert len(set(save_paths)) == 1, "save_paths must be the same for all samples in the batch"
         save_path = save_paths[0]
         if self.filepath is None:
             self.filepath = save_path
         assert self.filepath == save_path, f"save_paths must be the same for all metric calls, {self.filepath} != {save_path}"
-        self.num_repeats.append(num_repeats)
+        # self.num_repeats.append(num_repeats)
         self.N_toks_processed += true_probs.size()[0]
-        self.mean_non_pad_MLM_probs.append(batch["mean_non_pad_MLM_probs"])
+        if self.metric_to_return == "mean_is_correct":
+            self.N_correct_tokens += true_probs.sum()
+        elif self.metric_to_return == "mean_non_pad_MLM_probs":
+            self.return_metric.append(batch["mean_non_pad_MLM_probs"])
+        else:
+            raise ValueError(f"Invalid metric_to_return: {self.metric_to_return}")
         self._to_file(true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats)
 
     def _to_file(self, true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats):        
@@ -314,9 +342,9 @@ class bpLoss(Metric):
         
         if self.n_threads <= 1:
             # Use optimized single-threaded approach for I/O bottleneck scenarios
-            print("Using optimized single-threaded I/O approach")
             for shard_id, samples in sample_data_dict.items():
                 result = _write_samples_from_same_h5_to_file_single_thread(samples, 
+                                                                            self.metric_to_save,
                                                                             self.write2file_threshold, 
                                                                             self.filepath,
                                                                         )
@@ -333,7 +361,7 @@ class bpLoss(Metric):
                 # Submit all tasks
                 future_to_sample = {
                     executor.submit(_write_samples_from_same_h5_to_file_single_thread, 
-                    sample_data_dict[shard_id], self.write2file_threshold, self.filepath): shard_id
+                    sample_data_dict[shard_id], self.metric_to_save, self.write2file_threshold, self.filepath): shard_id
                     for shard_id in sample_data_dict.keys()
                 }
                 
@@ -354,18 +382,27 @@ class bpLoss(Metric):
         """Aggregate the state over all processes to compute the metric.
         """
         # convert to tensors and concatenate
-        true_probs = dim_zero_cat(self.true_probs)
-        offset_starts = dim_zero_cat(self.offset_starts)
-        offset_ends = dim_zero_cat(self.offset_ends)
-        shard_sample_ids = dim_zero_cat(self.shard_sample_ids)
-        shard_ids = dim_zero_cat(self.shard_ids)
-        num_repeats = dim_zero_cat(self.num_repeats)
-        mean_non_pad_MLM_probs = dim_zero_cat(self.mean_non_pad_MLM_probs)
+        # true_probs = dim_zero_cat(self.true_probs)
+        # offset_starts = dim_zero_cat(self.offset_starts)
+        # offset_ends = dim_zero_cat(self.offset_ends)
+        # shard_sample_ids = dim_zero_cat(self.shard_sample_ids)
+        # shard_ids = dim_zero_cat(self.shard_ids)
+        # num_repeats = dim_zero_cat(self.num_repeats)
+        # return_value = dim_zero_cat(self.return_metric)
 
         # self._to_file(true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats)
         # return self.N_toks_processed.item()
-        return mean_non_pad_MLM_probs.mean().item()
+        if self.metric_to_return == "mean_is_correct":
+            return self.N_correct_tokens.item() / self.N_toks_processed.item()
+        elif self.metric_to_return == "mean_non_pad_MLM_probs":
+            return self.return_metric.mean().item()
+        else:
+            raise ValueError(f"Invalid metric_to_return: {self.metric_to_return}")
+
         # TODO. Should we reset the state? Let's belive trainer will do it for us
+
+class eval_bpLoss(bpLoss):
+    pass
 
 class EfficientHuggingFaceModel(HuggingFaceModel):
     def eval_forward(self, batch, outputs: Optional[Any] = None):
@@ -519,6 +556,8 @@ def create_flex_bert_mlm(
         metrics += [EfficientZLoss()]
     if model_config.get("save_mlm_probs", None) is not None:
         metrics += [bpLoss(**model_config.get("save_mlm_probs", {}))]
+    if model_config.get("eval_mlm_probs", None) is not None:
+        metrics += [eval_bpLoss(**model_config.get("eval_mlm_probs", {}))]
 
     eval_metrics = copy.deepcopy(metrics)
     eval_metrics = [m for m in eval_metrics if m.__class__.__name__ != "bpLoss"] # we do not need to compute bpLoss on eval set
