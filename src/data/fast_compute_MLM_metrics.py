@@ -132,6 +132,23 @@ class _GenomeDatasetForMasking(NoStreamingGenomeDataset):
 			if self.mlm_efficiency_path:
 				# check if we have hdf_file
 				hdf5_file = os.path.join(self.mlm_efficiency_path, f"shard_{shard_id}.hdf5")
+				prgress_hdf5_file = os.path.join(self.mlm_efficiency_path, f"processed_samples.hdf5")
+				with FileLock(prgress_hdf5_file+".lock"):
+					if not os.path.exists(prgress_hdf5_file):
+						mode = "w" 
+						print (f"Creating progress file {prgress_hdf5_file}")
+					else: 
+						mode = "a"
+					with h5py.File(prgress_hdf5_file, mode) as f:
+						if str(shard_id) not in f:
+							# print (f"Creating progress dataset for shard {shard_id}")
+							f.create_dataset(str(shard_id), data=[False]*len(shard), dtype=bool)
+							# print (f"Progress dataset for shard {shard_id} created")
+						else:
+							processed = f[str(shard_id)][shard_sample_id]
+							if processed:
+								# print (f"Sample {shard_sample_id} in shard {shard_id} already processed, stopping iteration")
+								return None
 
 				with FileLock(hdf5_file+".lock"):
 					if not os.path.exists(hdf5_file):
@@ -153,7 +170,7 @@ class _GenomeDatasetForMasking(NoStreamingGenomeDataset):
 					result["shard_sample_id"] = [shard_sample_id]
 					result["mlm_efficiency_path"] = self.mlm_efficiency_path
 					result["mean_non_pad_MLM_probs"] = [0.] # just for a compatibility with the model, not really meaningful
-					yield result
+				return results
 		else:
 			raise RuntimeError("Data sample must contain a field with `text`")
 
@@ -244,8 +261,9 @@ class GenomeDatasetForMasking(IterableDataset):
 					with self.progress_counter.get_lock():
 						self.progress_counter.value += 1
 				samples = self.dataset.__getitem__(i)
-				for sample in samples:
-					yield sample
+				if samples is not None:
+					for sample in samples:
+						yield sample
 		# raise StopIteration # no need to raise, iteration will stop naturally when the dataset is exhausted
 
 

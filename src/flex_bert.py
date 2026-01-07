@@ -416,6 +416,22 @@ class eval_bpLoss(bpLoss):
         super().update(*args, **kwargs)
         self.reset()
 
+    def _to_file(self, true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats): 
+        super()._to_file(true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats)
+        save_path = os.path.join(self.filepath, f"processed_samples.hdf5")
+        # print (f"Saving processed samples to {save_path}")
+        with FileLock(save_path + ".lock"):
+            with h5py.File(save_path, "a") as f:
+                # Get unique pairs of (shard_id, sample_id)
+                unique_pairs = set(zip(shard_ids.cpu().numpy(), shard_sample_ids.cpu().numpy()))
+                
+                # Write each unique pair to the h5 file
+                for shard_id, sample_id in unique_pairs:
+                    shard_id_str = str(shard_id)
+                       
+                    # Set the sample_id to True
+                    f[shard_id_str][sample_id] = True
+
 class EfficientHuggingFaceModel(HuggingFaceModel):
     def eval_forward(self, batch, outputs: Optional[Any] = None):
         outputs = self.forward(batch) if outputs is None else outputs
