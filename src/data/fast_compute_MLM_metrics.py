@@ -35,6 +35,7 @@ from src.bert_layers.configuration_bert import FlexBertConfig
 from composer.utils.checkpoint import _ensure_valid_checkpoint
 from composer import Evaluator, Trainer
 from filelock import FileLock
+from composer.core import Callback
 import h5py
 
 # Initialize global logger
@@ -44,6 +45,11 @@ Tokenizer = Union[AutoTokenizer, Any]
 
 class _GenomeDatasetForMasking(NoStreamingGenomeDataset):
 	MLM_PROB_DTYPE = bool
+
+	def __init__(self, *args, **kwargs):
+		start_id = kwargs.pop("start_id", 0)
+		super().__init__(*args, **kwargs)
+		self.start_id = start_id
 
 	def _tokenize(self, text_sample):
 		assert self.tokenizer is not None, "Tokenizer required if data is not pretokenized"
@@ -118,6 +124,7 @@ class _GenomeDatasetForMasking(NoStreamingGenomeDataset):
 
 
 	def __getitem__(self, index: int):
+		index = index + self.start_id
 		shard_id, shard_sample_id = self.spanner[index]
 		shard = self.shards[shard_id]
 		sample = shard[shard_sample_id]
@@ -151,7 +158,7 @@ class _GenomeDatasetForMasking(NoStreamingGenomeDataset):
 			raise RuntimeError("Data sample must contain a field with `text`")
 
 	def __len__(self):
-		return self.len
+		return self.len - self.start_id
 
 class ProgressBarMonitor:
 	"""
@@ -439,6 +446,7 @@ def main():
 	parser.add_argument("--mlm_probability", type=float, default=0.12, help="Probability of masking tokens")
 	parser.add_argument("--log_level", type=str, default="INFO", help="Logging level")
 	parser.add_argument("--append_mlm_efficiency", action="store_true", help="Append to existing MLM efficiency files. If not set, automatically set to True for non-rank-0 processes in distributed mode.")
+	parser.add_argument("--start_id", type=int, default=0, help="Start id for the dataset; use 470000 to get human data for valid, on train it starts from 0")
 	args = parser.parse_args()
 
 	# Set logging level
@@ -468,7 +476,8 @@ def main():
 		max_seq_len=args.max_seq_len,
 		tokenizer=tokenizer,
 		mlm_efficiency_path=args.mlm_efficiency_path,
-		append_mlm_efficiency=append_mlm_efficiency
+		append_mlm_efficiency=append_mlm_efficiency,
+		start_id = args.start_id
 	)
 
 	# Create shared progress counter
@@ -477,6 +486,7 @@ def main():
 
 	collate_fn = DataCollatorForMaskingAllPositions(
 		tokenizer=tokenizer, mlm_probability=args.mlm_probability)
+
 	dataloader = DataLoader(
 		dataset,
 		collate_fn=collate_fn,
@@ -489,26 +499,17 @@ def main():
 		timeout=0,
 	)
 
-	# import inspect
-	# print (inspect.signature(model.forward))
+	class MetricOutputResetCallback(Callback):
+		def eval_batch_start(self, state, logger) -> None:
+			"""Called on the :attr:`.Event.EVAL_BATCH_END` event.
 
-	# test_batch = dataloader.__iter__().__next__()
-
-	# for batch in dataloader:
-	# 	for k, v in batch.items():
-	# 		if k != "mlm_efficiency_path":
-	# 			batch[k] = torch.tensor(v).to(device)
-	# 	print ("My batch:")
-	# 	print (batch["input_ids"][0][:20])
-	# 	with torch.no_grad():
-	# 		outputs = model(batch)
-	# 	print (outputs)
-	# 	raise ValueError("Stop here")
-
-	# for k, v in test_batch.items():
-	# 	for k, v in test_batch.items():
-	# 		if k != "mlm_efficiency_path":
-	# 			test_batch[k] = torch.tensor(v).to(device)
+			Args:
+				state (State): The training state.
+				logger (Logger): The logger.
+			"""
+			# print("Resetting metric output")
+			# print(f"Metric outputs were: {state.metric_outputs}")
+			state.metric_outputs =  {}
 
 	trainer = Trainer(
 		run_name="test",
@@ -517,6 +518,7 @@ def main():
 		eval_subset_num_batches=100000,
 		precision = "fp32",
 		progress_bar = False, # we already have a progress bar
+		callbacks = [MetricOutputResetCallback()],
 		# load_path = args.model_path, # not really necessary, because we loaded weights already
 	)
 

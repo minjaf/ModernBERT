@@ -291,12 +291,13 @@ class bpLoss(Metric):
         # self.num_repeats.append(num_repeats)
         self.N_toks_processed += true_probs.size()[0]
         if self.metric_to_return == "mean_is_correct":
-            self.N_correct_tokens += true_probs.sum()
+            self.N_correct_tokens += true_probs.sum().item()
         elif self.metric_to_return == "mean_non_pad_MLM_probs":
             self.return_metric.append(batch["mean_non_pad_MLM_probs"])
         else:
             raise ValueError(f"Invalid metric_to_return: {self.metric_to_return}")
         self._to_file(true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats)
+        del true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats
 
     def _to_file(self, true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats):        
         # convert to numpy
@@ -373,6 +374,7 @@ class bpLoss(Metric):
                         total_timedelta_opening_file += timedelta_opening_file
                         total_timedelta_writing_to_file += timedelta_writing_to_file
         
+        del true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats
         wall_time = datetime.datetime.now() - wall_time
         # print("---->timedelta_opening_file = ", total_timedelta_opening_file.total_seconds() * 1000, "ms")
         # print("---->timedelta_writing_to_file = ", total_timedelta_writing_to_file.total_seconds() * 1000, "ms")
@@ -388,13 +390,13 @@ class bpLoss(Metric):
         # shard_sample_ids = dim_zero_cat(self.shard_sample_ids)
         # shard_ids = dim_zero_cat(self.shard_ids)
         # num_repeats = dim_zero_cat(self.num_repeats)
-        # return_value = dim_zero_cat(self.return_metric)
 
         # self._to_file(true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats)
         # return self.N_toks_processed.item()
         if self.metric_to_return == "mean_is_correct":
-            return self.N_correct_tokens.item() / self.N_toks_processed.item()
+            return self.N_correct_tokens / self.N_toks_processed
         elif self.metric_to_return == "mean_non_pad_MLM_probs":
+            return_value = dim_zero_cat(self.return_metric)
             return self.return_metric.mean().item()
         else:
             raise ValueError(f"Invalid metric_to_return: {self.metric_to_return}")
@@ -402,7 +404,17 @@ class bpLoss(Metric):
         # TODO. Should we reset the state? Let's belive trainer will do it for us
 
 class eval_bpLoss(bpLoss):
-    pass
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.metric_to_return == "mean_non_pad_MLM_probs":
+            raise ValueError("""eval_bpLoss does not support mean_non_pad_MLM_probs.
+            During evaluation, we only compute the mean of the correct tokens.
+            Because we don't reset metric state, and mean_non_pad_MLM_probs requires accumulation
+            this will cause out of memory error""")
+
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        self.reset()
 
 class EfficientHuggingFaceModel(HuggingFaceModel):
     def eval_forward(self, batch, outputs: Optional[Any] = None):
