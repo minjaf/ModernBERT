@@ -166,7 +166,7 @@ def _write_sample_to_file(sample_data, f, metric_to_save, write2file_threshold):
     for i in range(num_repeat):
         token_idx = start_idx + i
         # update only if true prob is > write2file_threshold to save time
-        if true_probs[token_idx] > write2file_threshold:
+        if true_probs[token_idx] > write2file_threshold or write2file_threshold <= 0.0:
             st = offset_starts[token_idx]
             en = offset_ends[token_idx]
             if metric_to_save == "is_correct":
@@ -177,10 +177,14 @@ def _write_sample_to_file(sample_data, f, metric_to_save, write2file_threshold):
                 raise ValueError(f"Invalid metric_to_save: {metric_to_save}")
     f[str(shard_sample_id)][:] = data  # single write operation
 
-def _write_samples_from_same_h5_to_file_single_thread(samples, metric_to_save, write2file_threshold, filepath):
+def _write_samples_from_same_h5_to_file_single_thread(samples, metric_to_save, write2file_threshold, filepath, seen_samples_file):
     shard_id = [sample[-1] for sample in samples]
-    assert len(set(shard_id)) == 1, "shard_sample_ids must be the same for all samples"
+    assert len(set(shard_id)) == 1, "shard_ids must be the same for all samples"
     shard_id = shard_id[0]
+
+    if seen_samples_file is not None:
+        sample_ids = list(set([sample[0] for sample in samples]))
+
     save_path = os.path.join(filepath, f"shard_{shard_id}.hdf5")
     timestamp = datetime.datetime.now()
     with FileLock(save_path + ".lock"):
@@ -190,6 +194,21 @@ def _write_samples_from_same_h5_to_file_single_thread(samples, metric_to_save, w
             for sample in samples:
                 _write_sample_to_file(sample, f, metric_to_save, write2file_threshold)
             timedelta_writing_to_file = datetime.datetime.now() - timestamp
+    
+    if seen_samples_file is not None:
+        save_path = seen_samples_file
+        with FileLock(save_path + ".lock"):
+            assert os.path.exists(save_path), f"Seen samples file {save_path} does not exist"
+            with h5py.File(save_path, "a") as f:
+                shard_handler = f[str(shard_id)]
+                if len(sample_ids) < 100: # edit one by one
+                    for s in sample_ids:
+                        shard_handler[s] = True
+                else:
+                    shard_data = shard_handler[:].astype(bool)
+                    shard_data[sample_ids] = True
+                    f[str(shard_id)][:] = shard_data
+
     return timedelta_opening_file, timedelta_writing_to_file
 
 
@@ -203,7 +222,8 @@ class bpLoss(Metric):
     def __init__(self, dist_sync_on_step: bool = False, filepath: str | None = None,
             metric_to_save : str = "probability", # or "is_correct",
             metric_to_return : str = "mean_non_pad_MLM_probs", # or "mean_is_correct",
-            write2file_threshold: float = 0.0, n_threads: int = 1):
+            write2file_threshold: float = 0.0, n_threads: int = 1,
+            seen_samples_file: str | None = None):
         super().__init__(dist_sync_on_step=dist_sync_on_step)
         # self.add_state("true_probs", default=[], dist_reduce_fx="cat")
         # self.add_state("offset_starts", default=[], dist_reduce_fx="cat")
@@ -219,6 +239,7 @@ class bpLoss(Metric):
         self.metric_to_return = metric_to_return
         self.write2file_threshold = write2file_threshold
         self.n_threads = n_threads
+        self.seen_samples_file = seen_samples_file
 
     def update(self, logits: Tensor, labels_reduced: Tensor, labels_full: Tensor, batch: dict) -> None:
         """Updates the internal state with results from a new batch.
@@ -348,6 +369,7 @@ class bpLoss(Metric):
                                                                             self.metric_to_save,
                                                                             self.write2file_threshold, 
                                                                             self.filepath,
+                                                                            self.seen_samples_file,
                                                                         )
                 if result is not None:
                     timedelta_opening_file, timedelta_writing_to_file = result
@@ -357,6 +379,9 @@ class bpLoss(Metric):
             # Use multithreading for CPU-bound scenarios
             max_workers = min(self.n_threads, len(sample_data_dict))
             print(f"Using {max_workers} threads for multithreaded approach")
+
+            if self.seen_samples_file is not None:
+                raise NotImplementedError("Seen samples not implemented for multithreaded IO operations")
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all tasks
@@ -415,22 +440,6 @@ class eval_bpLoss(bpLoss):
     def update(self, *args, **kwargs):
         super().update(*args, **kwargs)
         self.reset()
-
-    def _to_file(self, true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats): 
-        super()._to_file(true_probs, offset_starts, offset_ends, shard_ids, shard_sample_ids, num_repeats)
-        save_path = os.path.join(self.filepath, f"processed_samples.hdf5")
-        # print (f"Saving processed samples to {save_path}")
-        with FileLock(save_path + ".lock"):
-            with h5py.File(save_path, "a") as f:
-                # Get unique pairs of (shard_id, sample_id)
-                unique_pairs = set(zip(shard_ids.cpu().numpy(), shard_sample_ids.cpu().numpy()))
-                
-                # Write each unique pair to the h5 file
-                for shard_id, sample_id in unique_pairs:
-                    shard_id_str = str(shard_id)
-                       
-                    # Set the sample_id to True
-                    f[shard_id_str][sample_id] = True
 
 class EfficientHuggingFaceModel(HuggingFaceModel):
     def eval_forward(self, batch, outputs: Optional[Any] = None):

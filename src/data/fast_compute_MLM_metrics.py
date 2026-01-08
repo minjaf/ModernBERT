@@ -1,4 +1,10 @@
 # Run like this:
+# CUDA_VISIBLE_DEVICES=1 python src/data/fast_compute_MLM_metrics.py --batch_size 96 --num_workers 8 --mlm_efficiency_path runs/test/mlm_efficiency/ --append_mlm_efficiency --job_number 1
+# or
+# composer src/data/fast_compute_MLM_metrics.py ...
+# or for many jobs:
+# for i in {2..100}; do CUDA_VISIBLE_DEVICES=1 python src/data/fast_compute_MLM_metrics.py --batch_size 96 --num_workers 8 --mlm_efficiency_path runs/test/mlm_efficiency/ --append_mlm_efficiency --job_number ${i}; done
+# for i in {101..200}; do CUDA_VISIBLE_DEVICES=0 python src/data/fast_compute_MLM_metrics.py --batch_size 96 --num_workers 8 --mlm_efficiency_path runs/test/mlm_efficiency/ --append_mlm_efficiency --job_number ${i}; done
 
 import os
 import argparse
@@ -49,7 +55,13 @@ class _GenomeDatasetForMasking(NoStreamingGenomeDataset):
 	def __init__(self, *args, **kwargs):
 		start_id = kwargs.pop("start_id", 0)
 		super().__init__(*args, **kwargs)
+		end_id = kwargs.pop("end_id", self.len)
 		self.start_id = start_id
+		self.end_id = end_id
+
+	def subsample_to_shards_slice(self, start, end):
+		self.start_id = self.spanner.shard_bounds[start] # start is inclusive
+		self.end_id = self.spanner.shard_bounds[end] # end is exclusive
 
 	def _tokenize(self, text_sample):
 		assert self.tokenizer is not None, "Tokenizer required if data is not pretokenized"
@@ -175,7 +187,7 @@ class _GenomeDatasetForMasking(NoStreamingGenomeDataset):
 			raise RuntimeError("Data sample must contain a field with `text`")
 
 	def __len__(self):
-		return self.len - self.start_id
+		return self.end_id - self.start_id
 
 class ProgressBarMonitor:
 	"""
@@ -392,7 +404,7 @@ def get_logger(logLevel=logging.INFO):
 	logger.addHandler(handler)
 	return logger
 
-def build_model(cfg: DictConfig):
+def build_model(cfg: DictConfig, seen_samples_file):
 	print (cfg.name)
 	if cfg.name == "hf_bert":
 		return hf_bert_module.create_hf_bert_mlm(
@@ -411,9 +423,10 @@ def build_model(cfg: DictConfig):
 			gradient_checkpointing=cfg.get("gradient_checkpointing", None),
 		)
 	elif cfg.name == "flex_bert":
-		cfg.model_config["eval_mlm_probs"] = {"write2file_threshold": 0.0, 
+		cfg.model_config["eval_mlm_probs"] = {"write2file_threshold": -1, 
 											  "metric_to_save": "is_correct", 
-											  "metric_to_return": "mean_is_correct"
+											  "metric_to_return": "mean_is_correct",
+											  "seen_samples_file": seen_samples_file
 											  } # ! force MLM probs saving and return mean of is_correct
 		return flex_bert_module.create_flex_bert_mlm(
 			pretrained_model_name=cfg.pretrained_model_name,
@@ -427,7 +440,7 @@ def build_model(cfg: DictConfig):
 	else:
 		raise ValueError(f"Not sure how to build model with name={cfg.name}")
 
-def load_model_and_tokenizer(checkpoint_filepath):
+def load_model_and_tokenizer(checkpoint_filepath, seen_samples_file):
 	# Load config
 	model_path = os.path.dirname(checkpoint_filepath)
 	cfg_path = os.path.join(model_path, "cfg.yaml")
@@ -436,7 +449,7 @@ def load_model_and_tokenizer(checkpoint_filepath):
 	# Load tokenizer
 	tokenizer = AutoTokenizer.from_pretrained("AIRI-Institute/gena-lm-bert-base-t2t")
 
-	model = build_model(yaml_cfg.model)
+	model = build_model(yaml_cfg.model, seen_samples_file)
 	
 	# Load checkpoint
 	logger.info(f"Loading checkpoint from {checkpoint_filepath}")
@@ -465,7 +478,15 @@ def main():
 	parser.add_argument("--log_level", type=str, default="INFO", help="Logging level")
 	parser.add_argument("--append_mlm_efficiency", action="store_true", help="Append to existing MLM efficiency files. If not set, automatically set to True for non-rank-0 processes in distributed mode.")
 	parser.add_argument("--start_id", type=int, default=0, help="Start id for the dataset; use 470000 to get human data for valid, on train it starts from 0")
+	parser.add_argument("--num_jobs", type=int, default=1000, help="Number of jobs")
+	parser.add_argument("--job_number", type=int, default=None, help="Number of jobs")
+
 	args = parser.parse_args()
+
+	if args.num_jobs != 0:
+		assert (args.start_id ==0) and (args.job_number is not None)
+		assert args.job_number < args.num_jobs
+
 
 	# Set logging level
 	log_level = getattr(logging, args.log_level.upper())
@@ -473,7 +494,10 @@ def main():
 
 	# Load model and tokenizer
 	logger.info(f"Loading model and tokenizer from {args.model_path}")
-	model, tokenizer = load_model_and_tokenizer(args.model_path)
+	print ("Seen samples file: ", os.path.join(args.mlm_efficiency_path, args.split, f"processed_samples.hdf5"))
+	model, tokenizer = load_model_and_tokenizer(args.model_path, 
+												seen_samples_file=os.path.join(args.mlm_efficiency_path, args.split, f"processed_samples.hdf5")
+			)
 	device = next(model.parameters()).device
 	
 	logger.info("Creating dataset")
@@ -498,8 +522,19 @@ def main():
 		start_id = args.start_id
 	)
 
+	if args.num_jobs != 0:
+		assert len(_dataset.shards) >= args.num_jobs
+		shard_ids = np.array_split(np.arange(len(_dataset.shards)), args.num_jobs)
+		job_shard_ids = shard_ids[args.job_number]
+		logger.info(f"Shards for the job {args.job_number}: {job_shard_ids[0]}-{job_shard_ids[-1]}")
+		_dataset.subsample_to_shards_slice(start=job_shard_ids[0], end=job_shard_ids[-1]+1)
+
+	self_made_pbar = True
 	# Create shared progress counter
-	progress_counter = multiprocessing.Value('i', 0)
+	if self_made_pbar:
+		progress_counter = multiprocessing.Value('i', 0)
+	else:
+		progress_counter = None
 	dataset = GenomeDatasetForMasking(_dataset, progress_counter=progress_counter)
 
 	collate_fn = DataCollatorForMaskingAllPositions(
@@ -512,7 +547,7 @@ def main():
 		drop_last=False,
 		num_workers=args.num_workers,
 		pin_memory=False,
-		prefetch_factor=2,
+		# prefetch_factor=2,
 		persistent_workers=False,
 		timeout=0,
 	)
@@ -533,16 +568,21 @@ def main():
 		run_name="test",
 		model=model,
 		eval_dataloader=dataloader,
-		eval_subset_num_batches=100000,
+		eval_subset_num_batches=1000000,
 		precision = "fp32",
-		progress_bar = False, # we already have a progress bar
+		progress_bar = not self_made_pbar, # we already have a progress bar
 		callbacks = [MetricOutputResetCallback()],
 		# load_path = args.model_path, # not really necessary, because we loaded weights already
 	)
 
 	# Monitor progress bar while trainer evaluates
-	with ProgressBarMonitor(progress_counter, total=len(_dataset), desc="Processing dataset"):
+	if self_made_pbar:
+		with ProgressBarMonitor(progress_counter, total=len(_dataset), desc="Processing dataset"):
+			trainer.eval()
+	else:
 		trainer.eval()
+	# with ProgressBarMonitor(progress_counter, total=len(_dataset), desc="Processing dataset"):
+	trainer.eval()
 
 if __name__ == "__main__":
 	main() 
