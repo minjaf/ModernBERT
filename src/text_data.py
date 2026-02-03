@@ -515,7 +515,9 @@ def build_no_streaming_dataset(
             min_seq_len=cfg.dataset.get("min_seq_len", 10),
             mlm_efficiency_path=cfg.dataset.get("mlm_efficiency_path", None),
             append_mlm_efficiency=cfg.dataset.get("append_mlm_efficiency", False),
-            use_mlm_efficiency_frequency=cfg.dataset.get("use_mlm_efficiency_frequency", 1)
+            fully_precomputed_mlm_efficiency=cfg.dataset.get("fully_precomputed_mlm_efficiency", False),
+            use_mlm_efficiency_frequency=cfg.dataset.get("use_mlm_efficiency_frequency", 1),
+            mask_probabilities_inverted=cfg.dataset.get("mask_probabilities_inverted", False),
         )
     else:
         return NoStreamingDataset(
@@ -730,7 +732,9 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         min_seq_len: int = 10,
         mlm_efficiency_path: str | None = None,
         append_mlm_efficiency: bool = False,
+        fully_precomputed_mlm_efficiency: bool = False,
         use_mlm_efficiency_frequency: float = 1.0,
+        mask_probabilities_inverted: bool = False,
     ) -> None:
         super().__init__(local, split, max_seq_len, tokenizer, pad_sequences)
         # todo: add seed and check that its ok for multiple workers
@@ -738,6 +742,8 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         self.sample_chunk = sample_chunk
         self.min_seq_len = min_seq_len
         self.mlm_efficiency_path = mlm_efficiency_path
+        self.mask_probabilities_inverted = mask_probabilities_inverted
+        self.fully_precomputed_mlm_efficiency = fully_precomputed_mlm_efficiency
 
         # get mean token length for tokenizer
         tokens = self.tokenizer.get_vocab()
@@ -763,7 +769,8 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
             if split is None:
                 raise ValueError("Split is required to save mlm efficiency")
             self.mlm_efficiency_path = self._get_full_mlm_efficiency_path(split)
-            os.makedirs(self.mlm_efficiency_path, exist_ok=append_mlm_efficiency)
+            if not fully_precomputed_mlm_efficiency:
+                os.makedirs(self.mlm_efficiency_path, exist_ok=append_mlm_efficiency)
             self.use_mlm_efficiency_frequency = use_mlm_efficiency_frequency
 
     def _get_full_mlm_efficiency_path(self, split: str) -> str:
@@ -834,6 +841,8 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
                 result["mlm_efficiency_path"] = self.mlm_efficiency_path
 
                 if not os.path.exists(hdf5_file):
+                    if self.fully_precomputed_mlm_efficiency:
+                        raise ValueError("Fully precomputed mlm efficiency is indicated but hdf5 file not found: "+hdf5_file)
                     # print (f"Shard shard_{shard_id}.hdf5 not found") # debug
                     with FileLock(hdf5_file+".lock"):
                         # print (f"Creating shard shard_{shard_id}.hdf5") # debug
@@ -845,6 +854,8 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
                 with FileLock(hdf5_file+".lock"):
                     with h5py.File(hdf5_file, "a") as f:
                         if str(shard_sample_id) not in f:
+                            if self.fully_precomputed_mlm_efficiency:
+                                raise ValueError(f"Fully precomputed mlm efficiency is indicated but sample not found in hdf5 file: {shard_sample_id}")
                             # print (f"Sample {shard_sample_id} not found in shard_{shard_id}.hdf5") # debug
                             f.create_dataset(str(shard_sample_id), data=[np.nan]*len(sample['text']), dtype=self.MLM_PROB_DTYPE)
 
@@ -860,7 +871,12 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
                         else:
                             mlm_probs = np.ones(end_index - start_index, dtype=self.MLM_PROB_DTYPE)
 
-                mlm_probs = np.nan_to_num(mlm_probs, nan=1.0, copy=False) # probability=1.0 for unseen positions
+                default_mlm_prob = 1.0 if not self.mask_probabilities_inverted else 0.0
+                mlm_probs = np.nan_to_num(mlm_probs, nan=default_mlm_prob, copy=False) # probability=1.0 for unseen positions
+                if self.mask_probabilities_inverted:
+                    mlm_probs = 1.0 - mlm_probs
+                    if (mlm_probs == 0.0).all():
+                        mlm_probs += 0.5 # add some constant to avoid all 0.0s
                 # mlm_probs are stored in base-pair resolution, so we need to convert them to bpe-token resolution according to offsets_mapping
                 mlm_probs_list = []
                 non_pad_MLM_probs = []

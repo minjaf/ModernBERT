@@ -170,9 +170,12 @@ def _write_sample_to_file(sample_data, f, metric_to_save, write2file_threshold):
             st = offset_starts[token_idx]
             en = offset_ends[token_idx]
             if metric_to_save == "is_correct":
-                data[st:en] = true_probs[token_idx]
+                data[st:en] = true_probs[token_idx] # ! important: in is_correct mode, we save probabilities
+                # to use with masking probabilities, we need to invert them in dataset
             elif metric_to_save == "probability":
-                data[st:en] = 1. - true_probs[token_idx]  # update in memory
+                data[st:en] = 1. - true_probs[token_idx]  # ! important: 
+                # in probability mode, we save inverted probabilities                 
+                # (which is direct measure of masking probaility)
             else:
                 raise ValueError(f"Invalid metric_to_save: {metric_to_save}")
     f[str(shard_sample_id)][:] = data  # single write operation
