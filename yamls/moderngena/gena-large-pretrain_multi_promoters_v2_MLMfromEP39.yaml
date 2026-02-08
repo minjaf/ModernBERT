@@ -1,4 +1,5 @@
-data_local: /mnt/nfs_dna/shadskiy/promoters/pretrena/mds_v2/
+# data_local: /mnt/nfs_dna/shadskiy/promoters/pretrena/mds_v2/
+data_local: data/promoter_mds_v2_train_with_MLM/
 data_remote: # If blank, files must be present in data_local
 
 max_seq_len: 1024
@@ -83,7 +84,8 @@ train_loader:
     shuffle: true
     mlm_probability: ${mlm_probability}
     streaming: false
-    mlm_efficiency_path: data/mlm_acc_from_base_ep129/
+    mlm_efficiency_in_shards: true
+    # mlm_efficiency_path: data/mlm_acc_from_base_ep129/
     append_mlm_efficiency: false
     fully_precomputed_mlm_efficiency: true
     use_mlm_efficiency_frequency: 0.9
@@ -141,8 +143,8 @@ global_eval_batch_size: 1024
 
 # System
 seed: 17
-device_eval_batch_size: 2 # debug
-device_train_microbatch_size: 2 # debug
+device_eval_batch_size: 16 # debug
+device_train_microbatch_size: 16 # debug
 precision: amp_bf16
 
 # Logging

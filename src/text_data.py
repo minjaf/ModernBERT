@@ -35,6 +35,7 @@ from transformers.data.data_collator import default_data_collator
 from transformers.tokenization_utils_base import BatchEncoding
 
 from filelock import FileLock
+from contextlib import nullcontext
 import h5py
 from Bio.Seq import Seq
 
@@ -504,6 +505,9 @@ def build_no_streaming_dataset(
     pad_sequences: bool = True,
 ):
     if cfg.dataset.get('data_type', None) == 'genome':
+        print ("----------------")
+        print (cfg.dataset.get("mlm_efficiency_in_shards", False))
+        print ("----------------")
         return NoStreamingGenomeDataset(
             tokenizer=tokenizer,
             local=cfg.dataset.get("local", None),
@@ -514,6 +518,7 @@ def build_no_streaming_dataset(
             sample_chunk=cfg.dataset.get("sample_chunk", False),
             min_seq_len=cfg.dataset.get("min_seq_len", 10),
             mlm_efficiency_path=cfg.dataset.get("mlm_efficiency_path", None),
+            mlm_efficiency_in_shards=cfg.dataset.get("mlm_efficiency_in_shards", False),            
             append_mlm_efficiency=cfg.dataset.get("append_mlm_efficiency", False),
             fully_precomputed_mlm_efficiency=cfg.dataset.get("fully_precomputed_mlm_efficiency", False),
             use_mlm_efficiency_frequency=cfg.dataset.get("use_mlm_efficiency_frequency", 1),
@@ -561,7 +566,9 @@ def build_text_dataloader(
         )
 
     mlm_probability = cfg.dataset.get("mlm_probability", None)
-    use_adaptive_mlm_probability = cfg.dataset.get("mlm_efficiency_path", None) is not None
+    use_adaptive_mlm_probability = (cfg.dataset.get("mlm_efficiency_path", None) is not None) or \
+                                    cfg.dataset.get("mlm_efficiency_in_shards", False)
+
     # only use sequence packing if using the no_streaming_dataset
     # if not cfg.dataset.get("streaming", True) and cfg.get("sequence_packing", False):
     if use_sequence_packing:
@@ -731,6 +738,7 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         sample_chunk: bool = False,
         min_seq_len: int = 10,
         mlm_efficiency_path: str | None = None,
+        mlm_efficiency_in_shards: bool = False,
         append_mlm_efficiency: bool = False,
         fully_precomputed_mlm_efficiency: bool = False,
         use_mlm_efficiency_frequency: float = 1.0,
@@ -742,6 +750,7 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         self.sample_chunk = sample_chunk
         self.min_seq_len = min_seq_len
         self.mlm_efficiency_path = mlm_efficiency_path
+        self.mlm_efficiency_in_shards = mlm_efficiency_in_shards
         self.mask_probabilities_inverted = mask_probabilities_inverted
         self.fully_precomputed_mlm_efficiency = fully_precomputed_mlm_efficiency
 
@@ -765,13 +774,18 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         self.mean_token_length = sum(token_lengths) / len(token_lengths)
         # print (f"Mean token length: {self.mean_token_length}") # debug
     
-        if self.mlm_efficiency_path is not None:
+        if self.mlm_efficiency_path is not None or self.mlm_efficiency_in_shards:
+            if self.mlm_efficiency_path and self.mlm_efficiency_in_shards:
+                raise ValueError("Specify either mlm_efficiency_in_shards or mlm_efficiency_in_shards, not both")
+            self.use_mlm_efficiency_frequency = use_mlm_efficiency_frequency
             if split is None:
                 raise ValueError("Split is required to save mlm efficiency")
-            self.mlm_efficiency_path = self._get_full_mlm_efficiency_path(split)
-            if not fully_precomputed_mlm_efficiency:
-                os.makedirs(self.mlm_efficiency_path, exist_ok=append_mlm_efficiency)
-            self.use_mlm_efficiency_frequency = use_mlm_efficiency_frequency
+            if self.mlm_efficiency_path is not None:
+                self.mlm_efficiency_path = self._get_full_mlm_efficiency_path(split)
+                if not fully_precomputed_mlm_efficiency:
+                    os.makedirs(self.mlm_efficiency_path, exist_ok=append_mlm_efficiency)
+            else:
+                assert not append_mlm_efficiency, "Can not append mlm efficiency when it is in mds files"
 
     def _get_full_mlm_efficiency_path(self, split: str) -> str:
         if self.mlm_efficiency_path is None:
@@ -800,11 +814,11 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         text = text[:max_seq_len * 10]  # cut to make tokenization faster if text is too long
 
         if self.augment_rc and random.random() > 0.5:
-            if self.mlm_efficiency_path:
+            if self.mlm_efficiency_path or self.mlm_efficiency_in_shards:
                 raise NotImplementedError("Reverse complement is not supported for adaptive masking")
             text = str(Seq(text).reverse_complement())
 
-        if self.mlm_efficiency_path:
+        if self.mlm_efficiency_path or self.mlm_efficiency_in_shards:
             # we need to 
             # 1) load the mlm efficiency data
             # 2) propagate offeset mapping through the model to save predicts later
@@ -830,53 +844,64 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         return result
 
     def __getitem__(self, index: int):
+        import datetime
+        tstamp = datetime.datetime.now()
+        # print (f"fetch {index}, {self.mlm_efficiency_path}")
         shard_id, shard_sample_id = self.spanner[index]
         shard = self.shards[shard_id]
         sample = shard[shard_sample_id]
         if "text" in sample:
             result = self._tokenize(sample)
-            if self.mlm_efficiency_path:
-                # check if we have hdf_file
-                hdf5_file = os.path.join(self.mlm_efficiency_path, f"shard_{shard_id}.hdf5")
-                result["mlm_efficiency_path"] = self.mlm_efficiency_path
-
-                if not os.path.exists(hdf5_file):
-                    if self.fully_precomputed_mlm_efficiency:
-                        raise ValueError("Fully precomputed mlm efficiency is indicated but hdf5 file not found: "+hdf5_file)
-                    # print (f"Shard shard_{shard_id}.hdf5 not found") # debug
-                    with FileLock(hdf5_file+".lock"):
-                        # print (f"Creating shard shard_{shard_id}.hdf5") # debug
-                        with h5py.File(hdf5_file, "w") as f:
-                            f.create_dataset(str(shard_sample_id), data=[np.nan]*len(sample['text']), dtype=self.MLM_PROB_DTYPE)
-
-                # check if we have sample in hdf_file
-                # print ("Acquiring mlm probs for ", hdf5_file) # debug
-                with FileLock(hdf5_file+".lock"):
-                    with h5py.File(hdf5_file, "a") as f:
-                        if str(shard_sample_id) not in f:
-                            if self.fully_precomputed_mlm_efficiency:
-                                raise ValueError(f"Fully precomputed mlm efficiency is indicated but sample not found in hdf5 file: {shard_sample_id}")
-                            # print (f"Sample {shard_sample_id} not found in shard_{shard_id}.hdf5") # debug
-                            f.create_dataset(str(shard_sample_id), data=[np.nan]*len(sample['text']), dtype=self.MLM_PROB_DTYPE)
-
-                        start_index = min(result["offsets_mapping_starts"])
-                        end_index = max(result["offsets_mapping_ends"])
-                        assert end_index - start_index <= len(sample['text'])
-                        assert end_index - start_index >= 0
-                        
-                        use_mlm_efficiency = random.random() < self.use_mlm_efficiency_frequency
-                        # print (f"------>>>>>use_mlm_efficiency = {use_mlm_efficiency}") # debug
-                        if use_mlm_efficiency:
-                            mlm_probs = f[str(shard_sample_id)][start_index:end_index]
-                        else:
-                            mlm_probs = np.ones(end_index - start_index, dtype=self.MLM_PROB_DTYPE)
-
+            
+            if self.mlm_efficiency_path or self.mlm_efficiency_in_shards: # going to return precomputed mlm probs
                 default_mlm_prob = 1.0 if not self.mask_probabilities_inverted else 0.0
+                use_mlm_efficiency = random.random() < self.use_mlm_efficiency_frequency
+                start_index = min(result["offsets_mapping_starts"])
+                end_index = max(result["offsets_mapping_ends"])
+                assert end_index - start_index <= len(sample['text'])
+                assert end_index - start_index >= 0
+
+                if not use_mlm_efficiency: # skip precomputed mlms and return defaults
+                    mlm_probs = np.zeros(end_index - start_index, dtype=self.MLM_PROB_DTYPE)
+                    mlm_probs += default_mlm_prob
+                    result["mlm_efficiency_path"] = self.mlm_efficiency_path if self.mlm_efficiency_path else "none"
+                elif self.mlm_efficiency_path: # read from hdf files
+                    # check if we have hdf_file
+                    hdf5_file = os.path.join(self.mlm_efficiency_path, f"shard_{shard_id}.hdf5")
+                    result["mlm_efficiency_path"] = self.mlm_efficiency_path
+
+                    if not os.path.exists(hdf5_file):
+                        if self.fully_precomputed_mlm_efficiency:
+                            raise ValueError("Fully precomputed mlm efficiency is indicated but hdf5 file not found: "+hdf5_file)
+                        # print (f"Shard shard_{shard_id}.hdf5 not found") # debug
+                        with FileLock(hdf5_file+".lock"):
+                            # print (f"Creating shard shard_{shard_id}.hdf5") # debug
+                            with h5py.File(hdf5_file, "w") as f:
+                                f.create_dataset(str(shard_sample_id), data=[np.nan]*len(sample['text']), dtype=self.MLM_PROB_DTYPE)
+
+                    # check if we have sample in hdf_file
+                    # print ("Acquiring mlm probs for ", hdf5_file) # debug
+                    mode = "r" if self.fully_precomputed_mlm_efficiency else "a"
+                    lock_cm = FileLock(hdf5_file + ".lock") if not self.fully_precomputed_mlm_efficiency else nullcontext()
+                    with lock_cm:
+                        with h5py.File(hdf5_file, mode) as f:
+                            if str(shard_sample_id) not in f:
+                                if self.fully_precomputed_mlm_efficiency:
+                                    raise ValueError(f"Fully precomputed mlm efficiency is indicated but sample not found in hdf5 file: {shard_sample_id}")
+                                # print (f"Sample {shard_sample_id} not found in shard_{shard_id}.hdf5") # debug
+                                f.create_dataset(str(shard_sample_id), data=[np.nan]*len(sample['text']), dtype=self.MLM_PROB_DTYPE)
+
+                            # print (f"------>>>>>use_mlm_efficiency = {use_mlm_efficiency}") # debug
+                            mlm_probs = f[str(shard_sample_id)][start_index:end_index]
+                else: # read from shard
+                    mlm_probs = sample["MLM"]
+                    result["mlm_efficiency_path"] = "none"
+
                 mlm_probs = np.nan_to_num(mlm_probs, nan=default_mlm_prob, copy=False) # probability=1.0 for unseen positions
+
                 if self.mask_probabilities_inverted:
                     mlm_probs = 1.0 - mlm_probs
-                    if (mlm_probs == 0.0).all():
-                        mlm_probs += 0.5 # add some constant to avoid all 0.0s
+
                 # mlm_probs are stored in base-pair resolution, so we need to convert them to bpe-token resolution according to offsets_mapping
                 mlm_probs_list = []
                 non_pad_MLM_probs = []
@@ -888,7 +913,16 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
                         non_pad_MLM_probs.append(np.mean(mlm_probs[tok_start-start_index:tok_end-start_index]))
                     else:
                         raise ValueError(f"tok_end - tok_start = {tok_end - tok_start} is negative")
+                assert len(mlm_probs_list)==len(result["offsets_mapping_starts"])==len(result["offsets_mapping_ends"])
                 if len(non_pad_MLM_probs) > 0:
+                    all_zeros = all([m==0 for m in non_pad_MLM_probs])
+                    if all_zeros: # add some constant to avoid all 0.0s
+                        for index, (m,st,en) in enumerate(zip(mlm_probs_list,
+                                                                result["offsets_mapping_starts"], 
+                                                                result["offsets_mapping_ends"])
+                                                        ):
+                            if en != st: # this is not service token
+                                mlm_probs_list[index] += 0.5
                     result["mean_non_pad_MLM_probs"] = np.mean(non_pad_MLM_probs)
                 else:
                     raise ValueError("No mlm probs found")
@@ -897,8 +931,10 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
                 # propagate shard id and shard sample id to save MLM probs after we get it
                 result["shard_id"] = [shard_id]
                 result["shard_sample_id"] = [shard_sample_id]
-                # print ("Done") # debug
-            return result
+                return result
+            else:
+                # raise ValueError("Why we are here? Split is {self.split}")
+                return result
         else:
             raise RuntimeError("Data sample must contain a field with `text`")
 
