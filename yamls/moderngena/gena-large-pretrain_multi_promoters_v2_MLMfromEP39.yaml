@@ -177,5 +177,7 @@ loggers:
 save_interval: 200ba
 save_num_checkpoints_to_keep: 5  # Important, this cleans up checkpoints saved to DISK
 
+# spin_dataloaders: False
+
 # Load from local filesystem or remote object store to
 # load_path: null
