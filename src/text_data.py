@@ -38,6 +38,7 @@ from filelock import FileLock
 from contextlib import nullcontext
 import h5py
 from Bio.Seq import Seq
+from fractions import Fraction
 
 # Add src folder root to path to allow us to use relative imports regardless of what directory the script is run from
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
@@ -505,9 +506,6 @@ def build_no_streaming_dataset(
     pad_sequences: bool = True,
 ):
     if cfg.dataset.get('data_type', None) == 'genome':
-        print ("----------------")
-        print (cfg.dataset.get("mlm_efficiency_in_shards", False))
-        print ("----------------")
         return NoStreamingGenomeDataset(
             tokenizer=tokenizer,
             local=cfg.dataset.get("local", None),
@@ -523,6 +521,7 @@ def build_no_streaming_dataset(
             fully_precomputed_mlm_efficiency=cfg.dataset.get("fully_precomputed_mlm_efficiency", False),
             use_mlm_efficiency_frequency=cfg.dataset.get("use_mlm_efficiency_frequency", 1),
             mask_probabilities_inverted=cfg.dataset.get("mask_probabilities_inverted", False),
+            split_as_subsample_from_train_split=cfg.dataset.get("split_as_subsample_from_train_split", False),
         )
     else:
         return NoStreamingDataset(
@@ -732,6 +731,7 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         local: str,
         split: Optional[str],
         max_seq_len: int,
+        split_as_subsample_from_train_split: Union[bool, float] = False, # if float, use the fraction of the train split to create other splits (default: False)
         tokenizer: Optional[Tokenizer] = None,
         pad_sequences: bool = True,
         augment_rc: bool = False,
@@ -744,7 +744,42 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         use_mlm_efficiency_frequency: float = 1.0,
         mask_probabilities_inverted: bool = False,
     ) -> None:
-        super().__init__(local, split, max_seq_len, tokenizer, pad_sequences)
+        """
+        Args:
+            local: path to the local directory
+            split: split to use
+            max_seq_len: maximum sequence length
+            split_as_subsample_from_train_split: if True, use the train split to create the valid split; if float, use the fraction of the train split to create the valid split (default: False)
+            tokenizer: tokenizer to use
+            pad_sequences: if True, pad sequences to the maximum sequence length
+            augment_rc: if True, augment the sequences with reverse complement
+            sample_chunk: if True, sample chunks of sequences
+            min_seq_len: minimum sequence length
+            mlm_efficiency_path: path to the mlm efficiency file (default: None)
+            mlm_efficiency_in_shards: if True, use the mlm efficiency in shards (default: False)
+            append_mlm_efficiency: if True, append the mlm efficiency to the file (default: False)
+            fully_precomputed_mlm_efficiency: if True, use the fully precomputed mlm efficiency (default: False)
+            use_mlm_efficiency_frequency: frequency of using mlm efficiency (default: 1.0)
+            mask_probabilities_inverted: if True, invert the mask probabilities (default: False)
+        """
+
+        print ("------------------------ in NoStreamingGenomeDataset __init__ ------------------------")
+
+        if isinstance(split_as_subsample_from_train_split, float):
+            print ("------------------------ split_as_subsample_from_train_split ------------------------")
+            assert 0 < split_as_subsample_from_train_split < 1, "split_as_subsample_from_train_split must be a float between 0 and 1"
+            self.split_as_subsample_from_train_split = split_as_subsample_from_train_split
+            self.split = split
+            # always init as train to get all samples
+            super().__init__(local, "train", max_seq_len, tokenizer, pad_sequences)  
+            frac = Fraction(split_as_subsample_from_train_split).limit_denominator(max_denominator=super().__len__()-1)           
+            self.frac_p = frac.numerator
+            self.frac_q = frac.denominator
+            logger.info(f"Creating valid split as a subsample from train split. Split: {split}, fraction: {self.frac_p}/{self.frac_q}")
+        else:
+            assert not split_as_subsample_from_train_split, "split_as_subsample_from_train_split must be a float between 0 and 1 or False"
+            super().__init__(local, split, max_seq_len, tokenizer, pad_sequences)
+
         # todo: add seed and check that its ok for multiple workers
         self.augment_rc = augment_rc
         self.sample_chunk = sample_chunk
@@ -791,6 +826,17 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         if self.mlm_efficiency_path is None:
             return None
         return os.path.join(self.mlm_efficiency_path, split + "/")
+
+    def __len__(self):
+        if self.split_as_subsample_from_train_split:
+            n = super().__len__()
+            train_len = (n // self.frac_q) * self.frac_p + min(n % self.frac_q, self.frac_p) 
+            if self.split == "train":
+                return train_len   # number of kept ids
+            else:
+                return n - train_len  # number of kept ids
+        else:
+            return super().__len__()
 
     def _tokenize(self, text_sample):
         assert self.tokenizer is not None, "Tokenizer required if data is not pretokenized"
@@ -844,9 +890,18 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         return result
 
     def __getitem__(self, index: int):
-        import datetime
-        tstamp = datetime.datetime.now()
+        # import datetime
+        # tstamp = datetime.datetime.now()
         # print (f"fetch {index}, {self.mlm_efficiency_path}")
+
+        if self.split_as_subsample_from_train_split:
+            if self.split == "train":
+                index = (index // self.frac_p) * self.frac_q + index % self.frac_p
+            else:
+                r = self.frac_q - self.frac_p
+                index = (index // r) * self.frac_q + self.frac_p + (index % r)
+            assert index < super().__len__(), f"Index {index} is out of bounds for split {self.split} with length {super().__len__()}, frac_p: {self.frac_p}, frac_q: {self.frac_q}"
+
         shard_id, shard_sample_id = self.spanner[index]
         shard = self.shards[shard_id]
         sample = shard[shard_sample_id]
@@ -937,7 +992,6 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
                 return result
         else:
             raise RuntimeError("Data sample must contain a field with `text`")
-
 
 # Helpful to test if your dataloader is working locally
 # Run `python data.py  --local_path [local] [--remote_path remote, optional]` and verify that batches are printed out

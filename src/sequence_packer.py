@@ -288,7 +288,6 @@ class SequencePacker(ABC):
         pad_token: int = -1,
         ignore_index: int = -100,
         np_rng=np.random.default_rng(),
-        mask_probs_array: Optional[np.ndarray] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original.
@@ -312,15 +311,7 @@ class SequencePacker(ABC):
           seq (np.ndarray): the input token IDs (e.g., a sequence, or batch of seqs)
           mask_prob (float): probability of initially masking a token, in the first "wave" of masking
           mask_token (int): token to use for masking
-          pad_token (int): token used for padding
           ignore_index (int): the token indicating that position should be ignored during training. We call it `ignore_index` to conform to the API of the cross entropy loss function.
-          np_rng: numpy random number generator
-          mask_probs_array (Optional[np.ndarray]): array of the same shape as seq specifying relative masking probabilities for each token. 
-                                                   relative - means that sum of array expected to be ~1.0.
-                                                   The array will be normalized so that the overall masking rate equals mask_prob.                                                   
-                                                   for example: with mask_prob=0.25 and mask_probs_array=[0.25, 0.25, 0.25, 0.01]
-                                                   the masking rate will be 0.25 * 1.33 , 0.25 * 1.33 , 0.25 * 1.33 , 0.01 * 1.33
-                                                   If None, uses uniform mask_prob for all tokens.
 
         Returns:
             tuple[np.array,np.array]: (masked_seq, labels)
@@ -333,32 +324,13 @@ class SequencePacker(ABC):
         # Create a single mask
         rand = np_rng.random(seq.shape)
 
-        # Use mask_probs_array if provided, otherwise use uniform mask_prob
-        if mask_probs_array is not None:
-            # Validate that mask_probs_array has the same shape as seq
-            if mask_probs_array.shape != seq.shape:
-                raise ValueError(f"mask_probs_array shape {mask_probs_array.shape} must match seq shape {seq.shape}")
-            
-            # Normalize mask_probs_array so that the average probability equals mask_prob
-            # This ensures that approximately mask_prob * 100% of tokens are masked overall
-            avg_prob = np.mean(mask_probs_array)
-            assert avg_prob <= 1.0, f"avg_prob {avg_prob} must be less than 1.0"
-            assert avg_prob > 0.0, f"avg_prob {avg_prob} must be greater than 0.0"
-            # Scale the probabilities to maintain the target average
-            mask_probs = mask_probs_array * (mask_prob / avg_prob)
-            # Clip to ensure probabilities stay in [0, 1] range
-            mask_probs = np.clip(mask_probs, 0.0, 1.0)
-        else:
-            # Use uniform probability
-            mask_probs = np.full(seq.shape, mask_prob)
-
         # Partition the probability space appropriately using a single mask
         # 80% of the time, we mask the token
-        mask_mask = rand < mask_probs * 0.8
+        mask_mask = rand < mask_prob * 0.8
         # 10% of the time, we replace the token with a random token
-        random_mask = (rand >= mask_probs * 0.8) & (rand < mask_probs * 0.9)
+        random_mask = (rand >= mask_prob * 0.8) & (rand < mask_prob * 0.9)
         # 10% of the time, we keep the token the same
-        keep_mask = (rand >= mask_probs * 0.9) & (rand < mask_probs)
+        keep_mask = (rand >= mask_prob * 0.9) & (rand < mask_prob)
 
         # We only compute loss over the tokens marked for masking
         labels = np.where(mask_mask | random_mask | keep_mask, labels, ignore_index)
