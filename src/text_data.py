@@ -763,10 +763,7 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
             mask_probabilities_inverted: if True, invert the mask probabilities (default: False)
         """
 
-        print ("------------------------ in NoStreamingGenomeDataset __init__ ------------------------")
-
         if isinstance(split_as_subsample_from_train_split, float):
-            print ("------------------------ split_as_subsample_from_train_split ------------------------")
             assert 0 < split_as_subsample_from_train_split < 1, "split_as_subsample_from_train_split must be a float between 0 and 1"
             self.split_as_subsample_from_train_split = split_as_subsample_from_train_split
             self.split = split
