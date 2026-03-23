@@ -31,6 +31,7 @@ from .model import (
     BertPredictionHeadTransform,
     FlexBertModel,
     FlexBertForMaskedLM,
+    FlexBertForMaskedLMwAA,
     FlexBertForSequenceClassification,
     FlexBertForMultipleChoice,
 )
@@ -63,6 +64,7 @@ __all__ = [
     "FlexBertUnpadPreNormLayer",
     "FlexBertModel",
     "FlexBertForMaskedLM",
+    "FlexBertForMaskedLMwAA",
     "FlexBertForSequenceClassification",
     "FlexBertForMultipleChoice",
 ]

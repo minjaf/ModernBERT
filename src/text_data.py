@@ -372,16 +372,24 @@ class DataCollatorForLanguageModelingWithMLMProbs(transformers.DataCollatorForLa
             #     self.tokenizer, examples, return_tensors="pt", pad_to_multiple_of=self.pad_to_multiple_of
             # )
             # handle mlm_efficiency_path
-            if "mlm_efficiency_path" in examples[0]:
-                mlm_efficiency_paths = [example.pop("mlm_efficiency_path") for example in examples]
-            else:
-                mlm_efficiency_paths = None
+
+            mlm_efficiency_paths = []
+
+            # remove metadata and mlm_efficiency_path from the example
+            for example in examples:
+                if "metadata" in example: 
+                    example.pop("metadata")
+
+                if "mlm_efficiency_path" in example:
+                    mlm_efficiency_path = example.pop("mlm_efficiency_path")
+                    mlm_efficiency_paths.append(mlm_efficiency_path)
             
             # now handle all tensors
             batch = default_data_collator(examples, self.return_tensors)
             
             # and keep the mlm_efficiency_path as single value in the batch
-            if mlm_efficiency_paths is not None: 
+            if len(mlm_efficiency_paths) > 0:
+                assert len(set(mlm_efficiency_paths)) == 1, "mlm_efficiency_paths must be the same for all samples in the batch"
                 batch["mlm_efficiency_path"] = mlm_efficiency_paths
         else:
             raise NotImplementedError("Only dicts are supported for MLM with MLM probs")
@@ -394,13 +402,13 @@ class DataCollatorForLanguageModelingWithMLMProbs(transformers.DataCollatorForLa
         if self.mlm:
             if "MLM_probs" in batch:
                 batch["input_ids"], batch["labels"] = self.torch_mask_tokens(
-					batch["input_ids"], special_tokens_mask=special_tokens_mask, 
+                    batch["input_ids"], special_tokens_mask=special_tokens_mask, 
                     mask_probs_array=batch["MLM_probs"]
-				)
+                )
             else:
                 batch["input_ids"], batch["labels"] = self.torch_mask_tokens(
-					batch["input_ids"], special_tokens_mask=special_tokens_mask
-				)
+                    batch["input_ids"], special_tokens_mask=special_tokens_mask
+                )
         else:
             labels = batch["input_ids"].clone()
             if self.tokenizer.pad_token_id is not None:
@@ -523,6 +531,18 @@ def build_no_streaming_dataset(
             mask_probabilities_inverted=cfg.dataset.get("mask_probabilities_inverted", False),
             split_as_subsample_from_train_split=cfg.dataset.get("split_as_subsample_from_train_split", False),
         )
+    elif cfg.dataset.get('data_type', None) == 'genome_with_translation':
+        return NoStreamingGenomeAndProteinDataset(
+            tokenizer=tokenizer,
+            local=cfg.dataset.get("local", None),
+            split=cfg.dataset.get("split", None),
+            max_seq_len=cfg.dataset.max_seq_len,
+            pad_sequences=pad_sequences,
+            augment_rc=cfg.dataset.get("augment_rc", False),
+            sample_chunk=cfg.dataset.get("sample_chunk", False),
+            min_seq_len=cfg.dataset.get("min_seq_len", 10),
+            split_as_subsample_from_train_split=cfg.dataset.get("split_as_subsample_from_train_split", False),
+        )
     else:
         return NoStreamingDataset(
             tokenizer=tokenizer,
@@ -564,16 +584,20 @@ def build_text_dataloader(
             drop_last=cfg.drop_last,
         )
 
+    # we only need these variables for asserts
     mlm_probability = cfg.dataset.get("mlm_probability", None)
-    use_adaptive_mlm_probability = (cfg.dataset.get("mlm_efficiency_path", None) is not None) or \
-                                    cfg.dataset.get("mlm_efficiency_in_shards", False)
-
-    # only use sequence packing if using the no_streaming_dataset
-    # if not cfg.dataset.get("streaming", True) and cfg.get("sequence_packing", False):
+    
     if use_sequence_packing:
-        # if use_adaptive_mlm_probability: # TODO: implement adaptive MLM probability
-        #     raise NotImplementedError("Adaptive MLM probability is not supported for sequence packing")
-            
+        use_adaptive_mlm_probability = (cfg.dataset.get("mlm_efficiency_path", None) is not None) or \
+                                        cfg.dataset.get("mlm_efficiency_in_shards", False)
+
+        if use_adaptive_mlm_probability: # TODO: implement adaptive MLM probability
+            raise NotImplementedError("Adaptive MLM probability is not supported for sequence packing")
+
+        dataset_type = cfg.dataset.get('data_type', None)
+        if dataset_type == "genome_with_translation":
+            raise NotImplementedError("Sequence packing is not supported for genome_with_translation dataset")
+
         if cfg.dataset.get("streaming", True):
             # streaming dataset already handles splitting and shuffling data for each rank
             dataloader = DataLoader(
@@ -989,6 +1013,248 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
                 return result
         else:
             raise RuntimeError("Data sample must contain a field with `text`")
+
+class NoStreamingGenomeAndProteinDataset(NoStreamingDataset):
+    aa_list = [
+        'A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L', 'M', 'N',
+        'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y',
+        '*', 'U', 'O', 'X', 'IGS'
+    ]
+    AA_COL_X = aa_list.index('X')       # 23
+    AA_COL_IGS = aa_list.index('IGS')   # 24
+    AA_NCOLS = len(aa_list)             # 25
+    AA_PACKED_BYTES = (AA_NCOLS + 7) // 8 #4
+
+    @staticmethod
+    def unpack_sample(sample: dict) -> Tuple[List[str], str, int, np.ndarray, np.ndarray]:
+        """
+        Args:
+            sample: element of StreamingDataset (dict).
+        Returns:
+            cds_ids: List[str]
+            nt_seq: str
+            min_start: int
+            strand: np.ndarray uint8 shape (seqlen, 2)
+            aa: np.ndarray uint8 shape (seqlen, 25)
+        """
+
+        # 1) CDS_ids -> list[str]
+        cds_ids = json.loads(sample["CDS_ids"])
+
+        # 2) nt_seq -> str
+        nt_seq = sample["nt_seq"]
+        seqlen = len(nt_seq)
+
+        # 3) min_start -> int (ndarray shape (1,))
+        min_start_arr = sample["min_start"]
+        min_start = int(min_start_arr[0]) if hasattr(min_start_arr, "__len__") else int(min_start_arr)
+
+        # 4) strand_array packed -> (seqlen, 2)
+        strand_packed = sample["strand_array"]
+        strand = np.unpackbits(strand_packed, axis=1)[:, :2].astype(np.uint8)
+        strand = strand[:seqlen, :]
+
+        # 5) aa_array packed -> (seqlen, 25)
+        aa_packed = sample["aa_array"]
+
+        aa = np.unpackbits(aa_packed, axis=1)[:, :NoStreamingGenomeAndProteinDataset.AA_NCOLS].astype(np.uint8)
+        aa = aa[:seqlen, :]
+
+        return cds_ids, nt_seq, min_start, strand, aa
+
+    def __init__(
+        self,
+        local: str,
+        split: Optional[str],
+        max_seq_len: int,
+        split_as_subsample_from_train_split: Union[bool, float] = False, # if float, use the fraction of the train split to create other splits (default: False)
+        tokenizer: Optional[Tokenizer] = None,
+        pad_sequences: bool = True,
+        augment_rc: bool = False,
+        sample_chunk: bool = False,
+        min_seq_len: int = 10,
+        gap_token_id: int = 5,
+    ) -> None:
+        """
+        Args:
+            local: path to the local directory
+            split: split to use
+            max_seq_len: maximum sequence length
+            split_as_subsample_from_train_split: if True, use the train split to create the valid split; if float, use the fraction of the train split to create the valid split (default: False)
+            tokenizer: tokenizer to use
+            pad_sequences: if True, pad sequences to the maximum sequence length
+            augment_rc: if True, augment the sequences with reverse complement
+            sample_chunk: if True, sample chunks of sequences
+            min_seq_len: minimum sequence length
+        """
+
+        if isinstance(split_as_subsample_from_train_split, float):
+            assert 0 < split_as_subsample_from_train_split < 1, "split_as_subsample_from_train_split must be a float between 0 and 1"
+            self.split_as_subsample_from_train_split = split_as_subsample_from_train_split
+            self.split = split
+            # always init as train to get all samples
+            super().__init__(local, "train", max_seq_len, tokenizer, pad_sequences)  
+            frac = Fraction(split_as_subsample_from_train_split).limit_denominator(max_denominator=super().__len__()-1)           
+            self.frac_p = frac.numerator
+            self.frac_q = frac.denominator
+            logger.info(f"Creating valid split as a subsample from train split. Split: {split}, fraction: {self.frac_p}/{self.frac_q}")
+        else:
+            assert not split_as_subsample_from_train_split, "split_as_subsample_from_train_split must be a float between 0 and 1 or False"
+            super().__init__(local, split, max_seq_len, tokenizer, pad_sequences)
+
+        # todo: add seed and check that its ok for multiple workers
+        self.augment_rc = augment_rc
+        self.sample_chunk = sample_chunk
+        self.min_seq_len = min_seq_len
+
+        # get mean token length for tokenizer
+        tokens = self.tokenizer.get_vocab()
+
+        try:
+            all_special_tokens = self.tokenizer.special_tokens_map["additional_special_tokens"]
+        except KeyError:
+            all_special_tokens = []
+
+        for k,v in self.tokenizer.special_tokens_map.items():
+            if k != "additional_special_tokens":
+                all_special_tokens.append(v)
+                assert isinstance(v, str), f"Special token {v} is not a string"
+        
+        # exclude special tokens
+        tokens = {k: v for k, v in tokens.items() if k not in all_special_tokens}
+
+        token_lengths = [len(token) for token in tokens.keys()]
+        self.mean_token_length = sum(token_lengths) / len(token_lengths)
+
+        if gap_token_id is not None: # check that gap token id is correct
+            s = "N"*100
+            tokens = self.tokenizer.encode(s, add_special_tokens=False)
+            assert tokens[0] == gap_token_id, f"Gap token id {gap_token_id} does not match. I did tried to encode \n{s}\n and got \n{tokens}\n, while gap token is {gap_token_id}"
+            self.gap_token_id = gap_token_id
+    
+    def __len__(self):
+        if self.split_as_subsample_from_train_split:
+            n = super().__len__()
+            train_len = (n // self.frac_q) * self.frac_p + min(n % self.frac_q, self.frac_p) 
+            if self.split == "train":
+                return train_len   # number of kept ids
+            else:
+                return n - train_len  # number of kept ids
+        else:
+            return super().__len__()
+
+    def _tokenize(self, sample: dict):
+        assert self.tokenizer is not None, "Tokenizer required if data is not pretokenized"
+        if not hasattr(self.tokenizer, "_pad_token"):
+            self.tokenizer._pad_token = self.tokenizer.pad_token_id
+        if self.tokenizer._pad_token is None:
+            # Some tokenizers (e.g. GPT2 tokenizer) have no padding token which causes bugs
+            raise RuntimeError("If tokenizing on-the-fly, tokenizer must have a pad_token_id")
+
+        cds_ids, nt_seq, min_start, strand, aa = NoStreamingGenomeAndProteinDataset.unpack_sample(sample)
+        
+        text = nt_seq
+        st_index = 0
+        max_seq_len = self.max_seq_len
+        if self.sample_chunk:
+            # todo: do we really want uniform length sampling here?
+            max_seq_len = random.randint(self.min_seq_len, self.max_seq_len)
+            # choose start index somewhere in the first half
+            st_index = random.randint(0, max(1, len(text) - int(self.mean_token_length*max_seq_len*1.1))) # 1.1 is a safety factor
+
+        text = text[st_index:]
+        text = text[:max_seq_len * 10]  # cut to make tokenization faster if text is too long
+
+        strand = strand[st_index:st_index+len(text)]
+        aa = aa[st_index:st_index+len(text)]
+
+        if self.augment_rc and random.random() > 0.5:
+            text = text[::-1].translate(str.maketrans('ATGCNatgcn-', 'TACGNTACGN-'))
+            strand = strand[::-1][:, [1, 0]]
+            aa = aa[::-1]
+            
+        encoding = self.tokenizer(
+            text,
+            # return_tensors='pt',
+            truncation=True,
+            padding="max_length" if self.pad_sequences else False,
+            max_length=self.max_seq_len if self.pad_sequences else max_seq_len, # if we have sequence packing, we do not padd and truncate to max_seq_len; else we should have all sequences  having strictly the same length
+            return_offsets_mapping=True,
+        )
+
+        # map signals to text
+        token_ids = encoding['input_ids']
+        offset_mapping = encoding['offset_mapping']
+        for idx, token_id in enumerate(token_ids):
+            if token_id == self.gap_token_id: # gap token
+                assert idx > 0, "Gap token is at the beginning of the sequence"
+                offset_mapping[idx] = (offset_mapping[idx-1][1],offset_mapping[idx][1])
+                # offset_mapping[idx][0] = offset_mapping[idx-1][1]
+
+        # map basepair resolution targets to token resolution targets
+        targets = {NoStreamingGenomeAndProteinDataset.aa_list[k]:v for k,v in enumerate(aa.T)}
+        targets["strand"] = strand[:,0]
+
+        all_target_names = list(targets.keys())
+        all_targets = np.zeros((len(all_target_names), len(offset_mapping)), dtype=np.float32)
+        for target_type in targets.keys():
+            target_idx = all_target_names.index(target_type)
+            
+            if target_type != "strand": # check that the target type matches the amino acid
+                assert NoStreamingGenomeAndProteinDataset.aa_list[target_idx] == target_type, \
+                    f"Target type {target_type} does not match amino acid {NoStreamingGenomeAndProteinDataset.aa_list[target_idx]}"
+
+            for tok_id in range(len(offset_mapping)):
+                if offset_mapping[tok_id][0] == offset_mapping[tok_id][1]: # special token, set target to -100
+                    all_targets[target_idx][tok_id] = -100
+                    continue
+
+                local_targets = targets[target_type][offset_mapping[tok_id][0]:offset_mapping[tok_id][1]]
+                intragenic = targets["IGS"][
+                    offset_mapping[tok_id][0]:offset_mapping[tok_id][1]
+                ].sum() == 0
+
+                if target_type == "strand":
+                    local_targets = set(local_targets)
+                    if len(local_targets) == 1 and intragenic: # strand is consistent and we are intragenic
+                        all_targets[target_idx][tok_id] = list(local_targets)[0]
+                    else:
+                        all_targets[target_idx][tok_id] = -100
+                else: # amino acids
+                    all_targets[target_idx][tok_id] = local_targets.max()
+
+        result = {
+            "input_ids": encoding['input_ids'],
+            "attention_mask": encoding["attention_mask"],
+            "aa_labels": all_targets,
+        }
+
+        result["metadata"] = {}
+        result["metadata"]['CDS_ids'] = sample['CDS_ids']
+        result["metadata"]['st_index'] = st_index
+        result["metadata"]['seq_length_bp'] = len(text)
+
+        return result
+
+    def __getitem__(self, index: int):
+
+        if self.split_as_subsample_from_train_split:
+            if self.split == "train":
+                index = (index // self.frac_p) * self.frac_q + index % self.frac_p
+            else:
+                r = self.frac_q - self.frac_p
+                index = (index // r) * self.frac_q + self.frac_p + (index % r)
+            assert index < super().__len__(), f"Index {index} is out of bounds for split {self.split} with length {super().__len__()}, frac_p: {self.frac_p}, frac_q: {self.frac_q}"
+
+        shard_id, shard_sample_id = self.spanner[index]
+        shard = self.shards[shard_id]
+        sample = shard[shard_sample_id]
+        result = self._tokenize(sample)
+        result["metadata"]["index"] = index
+        result["metadata"]["shard_id"] = shard
+        result["metadata"]["shard_sample_id"] = shard_sample_id
+        
+        return result
 
 # Helpful to test if your dataloader is working locally
 # Run `python data.py  --local_path [local] [--remote_path remote, optional]` and verify that batches are printed out

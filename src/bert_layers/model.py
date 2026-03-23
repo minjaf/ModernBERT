@@ -50,13 +50,14 @@ import os
 import sys
 import warnings
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Add folder root to path to allow us to use relative imports regardless of what directory the script is run from
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 from transformers.modeling_outputs import (
@@ -1244,6 +1245,280 @@ class FlexBertForMaskedLM(FlexBertPreTrainedModel):
         if count_decoder and not self.config.tie_word_embeddings:
             params += _count_parameters(self.decoder, trainable)
         return params
+
+
+class FlexBertForMaskedLMwAA(FlexBertForMaskedLM):
+    """FlexBertForMaskedLM with auxiliary per-token binary (BCE) heads for AA labels."""
+    def __init__(self, config: FlexBertConfig):
+        if config.num_aa_labels is None:
+            raise ValueError("FlexBertForMaskedLMwAA requires config.num_aa_labels to be set")
+        if config.aa_loss_weight is None:
+            raise ValueError("FlexBertForMaskedLMwAA requires config.aa_loss_weight to be set")
+        super().__init__(config)
+        self.aa_head = nn.Linear(config.hidden_size, config.num_aa_labels)
+        init_weights(self.config, self.aa_head, self.config.hidden_size, type_of_module=ModuleType.final_out)
+
+    def _init_weights(self, module: Optional[nn.Module] = None, reset_params: Optional[bool] = None):
+        assert (module is None) != (reset_params is None), "arg module xor reset_params must be specified"
+        if module is not None:
+            super()._init_weights(module=module, reset_params=reset_params)
+            return
+        if reset_params is not None:
+            assert isinstance(reset_params, bool)
+            if hasattr(self, "aa_head"):
+                init_weights(self.config, self.aa_head, self.config.hidden_size, type_of_module=ModuleType.final_out)
+            return super()._init_weights(reset_params=reset_params)
+
+    @staticmethod
+    def _unpad_aa_labels(aa_labels: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        """(B, n_aa, S) -> (total_nnz, n_aa) using the same flat indices as `unpad_input`."""
+        b, n_aa, s = aa_labels.shape
+        return aa_labels.permute(0, 2, 1).contiguous().view(b * s, n_aa)[indices]
+
+    def _mlm_logits(self, mlm_hidden: torch.Tensor) -> torch.Tensor:
+        return self.compiled_head(mlm_hidden) if self.compile_model else self.decoder(self.head(mlm_hidden))
+
+    def _mlm_loss_and_z(
+        self, logits: torch.Tensor, labels: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Calls the configured MLM loss (optionally returns z_loss for flash-attn z-loss)."""
+        if self.return_z_loss:
+            mlm_loss, z_loss = self.loss_fn(logits, labels)
+            return mlm_loss, z_loss
+        return self.loss_fn(logits, labels), None
+
+    def _align_aa_labels(self, encoder_out_full: torch.Tensor, aa_labels: torch.Tensor) -> torch.Tensor:
+        """Match aa_labels layout to `aa_logits` from `self.aa_head(encoder_out_full)`: (B,S,n_aa) or (total_nnz,n_aa)."""
+        if encoder_out_full.dim() == 3:
+            return aa_labels.permute(0, 2, 1).contiguous()
+        if encoder_out_full.dim() == 2:
+            assert self.unpad_embeddings, "2D encoder output requires unpad_embeddings=True"
+            return aa_labels
+        raise ValueError(f"Unexpected encoder output dim {encoder_out_full.dim()}; expected 2 (unpadded) or 3 (padded).")
+
+    def _preview_aa_labels_aligned_for_loss(
+        self, aa_labels: torch.Tensor, indices: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Same layout as `_align_aa_labels` would produce, without running the encoder (for pipeline_debug)."""
+        if indices is not None:
+            return aa_labels
+        return aa_labels.permute(0, 2, 1).contiguous()
+
+    def _take_pipeline_debug_snapshot(
+        self,
+        input_ids: torch.Tensor,
+        aa_labels: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        indices: Optional[torch.Tensor],
+        cu_seqlens: Optional[torch.Tensor],
+        max_seqlen: Optional[int],
+        batch_size: Optional[int],
+        seq_len: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        """Tensors exactly as passed to `self.bert` plus AA tensors aligned to future `aa_head` output."""
+        dump_path = getattr(self.config, "pipeline_debug_dump_path", None)
+        if not dump_path:
+            return None
+        n = getattr(self, "_pipeline_debug_batches_seen", 0) + 1
+        self._pipeline_debug_batches_seen = n
+        if n > getattr(self.config, "pipeline_debug_max_batches", 10):
+            return None
+        snap: Dict[str, Any] = {"batch_idx": int(n)}
+        snap["input_ids"] = input_ids.detach().cpu()
+        if aa_labels is not None:
+            snap["aa_labels"] = aa_labels.detach().cpu()
+            snap["aa_labels_aligned_for_loss"] = self._preview_aa_labels_aligned_for_loss(
+                aa_labels, indices
+            ).detach().cpu()
+        if attention_mask is not None:
+            snap["attention_mask"] = attention_mask.detach().cpu()
+        if position_ids is not None:
+            snap["position_ids"] = position_ids.detach().cpu()
+        if indices is not None:
+            snap["indices"] = indices.detach().cpu()
+        if cu_seqlens is not None:
+            snap["cu_seqlens"] = cu_seqlens.detach().cpu()
+        snap["max_seqlen"] = int(max_seqlen) if max_seqlen is not None else -1
+        snap["batch_size"] = int(batch_size) if batch_size is not None else -1
+        snap["seq_len"] = int(seq_len) if seq_len is not None else -1
+        snap["encoder_layout"] = "unpadded" if indices is not None else "padded"
+        return snap
+
+    def _aa_bce_loss(self, aa_logits: torch.Tensor, aa_labels_aligned: torch.Tensor) -> torch.Tensor:
+        valid = aa_labels_aligned != -100
+        if not valid.any():
+            return aa_logits.new_zeros(())
+        tgt = aa_labels_aligned[valid].float()
+        assert torch.all((tgt == 0) | (tgt == 1)), (
+            "AA targets on valid positions must be exactly 0 or 1; "
+            f"got min={tgt.min().item()}, max={tgt.max().item()}"
+        )
+
+        # IndexError: The shape of the mask [1919, 26] at index 1 does not match the shape of the indexed tensor [1919, 25] at index 1
+        bce = F.binary_cross_entropy_with_logits(aa_logits[valid].float(), tgt, reduction="mean")
+        return self.config.aa_loss_weight * bce
+
+    @staticmethod
+    def _combine_mlm_and_aa_loss(
+        mlm_loss: Optional[torch.Tensor], aa_loss: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if mlm_loss is None:
+            return aa_loss
+        if aa_loss is None:
+            return mlm_loss
+        return mlm_loss + aa_loss
+
+    @staticmethod
+    def _attach_aa_aux(
+        out: Union[MaskedLMOutput, MaskedLMOutputZLoss],
+        aa_logits: torch.Tensor,
+        mlm_loss: Optional[torch.Tensor],
+        aa_loss: Optional[torch.Tensor],
+        pipeline_debug: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        out.aa_logits = aa_logits
+        if mlm_loss is not None:
+            out.mlm_loss = mlm_loss
+        if aa_loss is not None:
+            out.aa_loss = aa_loss
+        if pipeline_debug is not None:
+            out.pipeline_debug = pipeline_debug
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        return_dict: Optional[bool] = None,
+        indices: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        seq_len: Optional[int] = None,
+        aa_labels: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Union[Tuple[torch.Tensor], MaskedLMOutput]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # --- Unpad (optional): same layout as FlexBertForMaskedLM for ids, MLM labels, and aa_labels ---
+        if self.unpad_embeddings and (indices is None and cu_seqlens is None and max_seqlen is None):
+            batch_size, seq_len = input_ids.shape[:2]
+            input_ids, indices, cu_seqlens, max_seqlen, position_ids, labels = self.unpad_inputs(
+                input_ids, attention_mask, position_ids, labels
+            )
+            if aa_labels is not None:
+                aa_labels = self._unpad_aa_labels(aa_labels, indices)
+
+        pipeline_debug = self._take_pipeline_debug_snapshot(
+            input_ids,
+            aa_labels,
+            attention_mask,
+            position_ids,
+            indices,
+            cu_seqlens,
+            max_seqlen,
+            batch_size,
+            seq_len,
+        )
+
+        encoder_out_full = self.bert(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            indices=indices,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+
+        # --- MLM: optionally keep only masked positions for the LM head (AA uses full encoder_out_full below) ---
+        mlm_hidden = encoder_out_full
+        if self.masked_prediction and labels is not None:
+            labels_flat = labels.view(-1)
+            flat_hidden = mlm_hidden.view(labels_flat.shape[0], -1)
+            mlm_mask = labels_flat != self.loss_fn.ignore_index
+            mlm_hidden = flat_hidden[mlm_mask]
+            labels = labels_flat[mlm_mask]
+
+        logits = self._mlm_logits(mlm_hidden)
+
+        mlm_loss: Optional[torch.Tensor] = None
+        z_loss: Optional[torch.Tensor] = None
+        if labels is not None:
+            if self.masked_prediction:
+                mlm_loss, z_loss = self._mlm_loss_and_z(logits, labels)
+            else:
+                lf = labels.view(-1)
+                lg = logits.view(lf.shape[0], -1)
+                mlm_loss, z_loss = self._mlm_loss_and_z(lg, lf)
+
+        # --- AA: full sequence, loss on all positions where label != -100 ---
+        aa_logits = self.aa_head(encoder_out_full)
+        aa_loss: Optional[torch.Tensor] = None
+        if aa_labels is not None:
+            aa_loss = self._aa_bce_loss(aa_logits, self._align_aa_labels(encoder_out_full, aa_labels))
+
+        # return aa_logits to original (padded) shape - we need it in original shape to compute metrics
+        if self.unpad_embeddings:
+            aa_logits_padded = self.pad_inputs(aa_logits, indices, batch_size, seq_len)[0]
+        else:
+            aa_logits_padded = aa_logits
+
+        loss = self._combine_mlm_and_aa_loss(mlm_loss, aa_loss)
+
+        # --- Build outputs (z-loss path matches FlexBertForMaskedLM) ---
+        if self.return_z_loss and labels is not None:
+            ce_loss = mlm_loss.detach().clone() - z_loss
+            logits_out = (
+                self.pad_inputs(logits, indices, batch_size, seq_len)[0]
+                if self.pad_logits
+                else logits
+            )
+            if self.pad_logits:
+                out_z = MaskedLMOutputZLoss(
+                    loss=loss,
+                    ce_loss=ce_loss,
+                    z_loss=z_loss,
+                    logits=logits_out,
+                    hidden_states=None,
+                    attentions=None,
+                )
+            else:
+                out_z = MaskedLMOutputZLoss(
+                    loss=loss,
+                    ce_loss=ce_loss,
+                    z_loss=z_loss,
+                    logits=logits_out,
+                    hidden_states=None,
+                    attentions=None,
+                    indices=indices,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    labels=labels,
+                )
+            self._attach_aa_aux(out_z, aa_logits_padded, mlm_loss, aa_loss, pipeline_debug)
+            return out_z
+
+        if self.pad_logits and indices is not None:
+            logits = self.pad_inputs(logits, indices, batch_size, seq_len)[0]
+
+        out = MaskedLMOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=None,
+            attentions=None,
+            indices=indices,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            labels=labels,
+        )
+        self._attach_aa_aux(out, aa_logits_padded, mlm_loss, aa_loss, pipeline_debug)
+        return out
 
 
 class FlexBertForSequenceClassification(FlexBertPreTrainedModel):

@@ -97,6 +97,10 @@ class FlexBertConfig(TransformersBertConfig):
         pad_logits: bool = False,
         compile_model: bool = False,
         masked_prediction: bool = False,
+        num_aa_labels: int | None = None,
+        aa_loss_weight: float | None = None,
+        pipeline_debug_dump_path: str | None = None,
+        pipeline_debug_max_batches: int = 10,
         **kwargs,
     ):
         """
@@ -156,6 +160,11 @@ class FlexBertConfig(TransformersBertConfig):
             pad_logits (bool): Pad logits after the calculating the loss.
             compile_model (bool): Compile the subset of the model which can be compiled.
             masked_prediction (bool): Use only pass the masked tokens throught the final MLM layers
+            num_aa_labels (int | None): Number of per-token amino-acid binary heads (FlexBertForMaskedLMwAA).
+            aa_loss_weight (float | None): Weight for the AA BCE term (FlexBertForMaskedLMwAA).
+            pipeline_debug_dump_path (str | None): If set, first ``pipeline_debug_max_batches`` forwards attach
+                ``pipeline_debug`` (encoder-ready tensors) for :class:`PipelineDebugDumpMetric`.
+            pipeline_debug_max_batches (int): Cap for pipeline debug snapshots per run (default 10).
             **kwargs: Additional keyword arguments.
         """
         super().__init__(attention_probs_dropout_prob=attention_probs_dropout_prob, **kwargs)
@@ -213,6 +222,10 @@ class FlexBertConfig(TransformersBertConfig):
         self.pad_logits = pad_logits
         self.compile_model = compile_model
         self.masked_prediction = masked_prediction
+        self.num_aa_labels = num_aa_labels
+        self.aa_loss_weight = aa_loss_weight
+        self.pipeline_debug_dump_path = pipeline_debug_dump_path
+        self.pipeline_debug_max_batches = pipeline_debug_max_batches
 
         if loss_kwargs.get("return_z_loss", False):
             if loss_function != "fa_cross_entropy":

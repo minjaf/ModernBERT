@@ -47,7 +47,12 @@ try:
 except ImportError:
     CrossEntropyLoss = None
 
-all = ["create_flex_bert_mlm", "create_flex_bert_classification"]
+all = [
+    "create_flex_bert_mlm",
+    "create_flex_bert_mlm_aa",
+    "create_flex_bert_classification",
+    "PipelineDebugDumpMetric",
+]
 
 
 # we want the efficent versions to have the same name as the TorchMetrics' name
@@ -118,6 +123,35 @@ class EfficientCrossEntropy(Metric):
         # Return average loss over entire dataset
         return self.sum_loss / self.total_items  # type: ignore (third-party)
 
+# @rename_class("AACrossEntropy")
+# class EfficientAACrossEntropy(Metric):
+#     """Torchmetric that grabs the precomputed ce_loss value from the model outputs"""
+
+#     # Make torchmetrics call update only once
+#     full_state_update = False
+
+#     def __init__(self, dist_sync_on_step: bool = False):
+#         super().__init__(dist_sync_on_step=dist_sync_on_step)
+#         self.add_state("sum_loss", default=torch.tensor(0.0), dist_reduce_fx="sum")
+#         self.add_state("total_items", default=torch.tensor(0), dist_reduce_fx="sum")
+
+#     def update(self, loss: Tensor) -> None:
+#         """Updates the internal state with results from a new batch.
+
+#         Args:
+#             loss (~torch.Tensor): A Tensor of loss values to compare against.
+#         """
+#         self.sum_loss += loss
+#         self.total_items += 1
+
+#     def compute(self) -> Tensor:
+#         """Aggregate the state over all processes to compute the metric.
+
+#         Returns:
+#             loss: The loss averaged across all batches as a :class:`~torch.Tensor`.
+#         """
+#         # Return average loss over entire dataset
+#         return self.sum_loss / self.total_items  # type: ignore (third-party)
 
 @rename_class("ZLoss")
 class EfficientZLoss(Metric):
@@ -213,7 +247,6 @@ def _write_samples_from_same_h5_to_file_single_thread(samples, metric_to_save, w
                     f[str(shard_id)][:] = shard_data
 
     return timedelta_opening_file, timedelta_writing_to_file
-
 
 class bpLoss(Metric):
     """Torchmetric that grabs the per-sample per-token loss"""
@@ -444,6 +477,130 @@ class eval_bpLoss(bpLoss):
         super().update(*args, **kwargs)
         self.reset()
 
+
+class PerAALossAndF1(Metric):
+    """Computes per-AA mean BCE loss and binary F1; update() returns a dict of scalars for logging."""
+
+    full_state_update = False
+
+    def __init__(self, aa_label_names: list, dist_sync_on_step: bool = False):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+        self.aa_label_names = list(aa_label_names)
+
+    def update(self, aa_logits: Tensor, aa_labels: Tensor) -> Optional[Dict[str, float]]:
+        """aa_logits: (N, num_aa) or (B, S, num_aa); aa_labels: (N, num_aa) or (B, num_aa, S). Returns dict of aa_loss/NAME and aa_f1/NAME."""
+        if aa_logits is None or aa_labels is None:
+            return None
+        aa_logits = aa_logits.detach().float()
+        aa_labels = aa_labels.detach().float()
+
+        assert aa_logits.dim() == 3, f"aa_logits.dim() is {aa_logits.dim()} but expected 3"
+        assert aa_labels.dim() == 3, f"aa_labels.dim() is {aa_labels.dim()} but expected 3"
+
+        aa_labels = aa_labels.permute(0, 2, 1).contiguous()
+        assert aa_logits.size() == aa_labels.size(), f"aa_logits.size() is {aa_logits.size()} but aa_labels.size() is {aa_labels.size()}"        
+
+        aa_labels = aa_labels.reshape(-1, aa_labels.shape[-1])
+        aa_logits = aa_logits.reshape(-1, aa_logits.shape[-1])
+
+        n_aa = aa_logits.shape[1]
+        result = {}
+        for i in range(n_aa):
+            name = self.aa_label_names[i]
+            valid = aa_labels[:, i] != -100
+            if not valid.any():
+                continue
+            logits_i = aa_logits[:, i][valid]
+            labels_i = aa_labels[:, i][valid]
+            assert torch.all((labels_i == 0) | (labels_i == 1)), (
+                f"PerAALossAndF1: AA labels for head {name!r} must be 0 or 1 on valid positions; "
+                f"got min={labels_i.min().item()}, max={labels_i.max().item()}"
+            )
+            loss_i = torch.nn.functional.binary_cross_entropy_with_logits(logits_i, labels_i, reduction="mean")
+            result[f"aa_loss/{name}"] = loss_i.item()
+            pred_i = (logits_i > 0).float()
+            tp = ((pred_i == 1) & (labels_i == 1)).sum().float()
+            fp = ((pred_i == 1) & (labels_i == 0)).sum().float()
+            fn = ((pred_i == 0) & (labels_i == 1)).sum().float()
+            denom = tp + 0.5 * (fp + fn)
+            f1_i = (tp / denom).item() if denom > 0 else 0.0
+            result[f"aa_f1/{name}"] = f1_i
+        return result if result else None
+
+    def compute(self) -> Tensor:
+        return torch.tensor(0.0)
+
+
+class MLMAndAALossScalars(Metric):
+    """Logs scalar `mlm_loss` and aggregated `aa_loss` from FlexBertForMaskedLMwAA outputs (not per-AA)."""
+
+    full_state_update = False
+
+    def update(self, outputs: Any) -> Optional[Dict[str, float]]:
+        """Reads optional `mlm_loss` and `aa_loss` on the model output (same tensors used in the forward loss)."""
+        result: Dict[str, float] = {}
+        mlm = outputs.get("mlm_loss", None) if isinstance(outputs, dict) else getattr(outputs, "mlm_loss", None)
+        aa = outputs.get("aa_loss", None) if isinstance(outputs, dict) else getattr(outputs, "aa_loss", None)
+        if mlm is not None and torch.is_tensor(mlm):
+            result["mlm_loss"] = float(mlm.detach().item())
+        if aa is not None and torch.is_tensor(aa):
+            result["aa_loss"] = float(aa.detach().item())
+        return result if result else None
+
+    def compute(self) -> Tensor:
+        return torch.tensor(0.0)
+
+
+class PipelineDebugDumpMetric(Metric):
+    """Writes `outputs.pipeline_debug` (encoder-ready tensors) to compressed .npz files for manual DNA/AA checks.
+
+    Only rank 0 writes when distributed. Prefer ``num_workers=0`` and single-GPU to avoid duplicate/conflicting dumps.
+    """
+
+    full_state_update = False
+
+    def __init__(self, dump_dir: str, max_batches: int = 10, dist_sync_on_step: bool = False):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+        self.dump_dir = dump_dir
+        self.max_batches = max_batches
+        self._saved = 0
+
+    def update(self, outputs: Any) -> Optional[Dict[str, float]]:
+        dbg = getattr(outputs, "pipeline_debug", None) if not isinstance(outputs, dict) else outputs.get(
+            "pipeline_debug"
+        )
+        if dbg is None:
+            return None
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+                return None
+        except Exception:
+            pass
+        self._saved += 1
+        if self._saved > self.max_batches:
+            return None
+        os.makedirs(self.dump_dir, exist_ok=True)
+        batch_idx = int(dbg.get("batch_idx", self._saved))
+        path = os.path.join(self.dump_dir, f"encoder_inputs_batch_{batch_idx:05d}.npz")
+        np_dict: Dict[str, np.ndarray] = {}
+        for k, v in dbg.items():
+            if v is None:
+                continue
+            if torch.is_tensor(v):
+                np_dict[k] = v.detach().cpu().numpy()
+            elif isinstance(v, (int, float, bool)):
+                np_dict[k] = np.array(v)
+            elif isinstance(v, str):
+                np_dict[k] = np.array(v, dtype=object)
+        np.savez_compressed(path, **np_dict)
+        return {"pipeline_debug_dump_saved": 1.0}
+
+    def compute(self) -> Tensor:
+        return torch.tensor(0.0)
+
+
 class EfficientHuggingFaceModel(HuggingFaceModel):
     def eval_forward(self, batch, outputs: Optional[Any] = None):
         outputs = self.forward(batch) if outputs is None else outputs
@@ -457,7 +614,15 @@ class EfficientHuggingFaceModel(HuggingFaceModel):
         if getattr(metric, "needs_batch", False):
             raise ValueError(f"Unsupported metric {metric=}")
 
-        if getattr(outputs, "ce_loss", False) and isinstance(metric, EfficientCrossEntropy):
+        if isinstance(metric, PerAALossAndF1):
+            aa_logits = getattr(outputs, "aa_logits", None)
+            aa_labels = batch.get("aa_labels", None)
+            metric_result = metric.update(aa_logits, aa_labels) if (aa_logits is not None and aa_labels is not None) else None
+        elif isinstance(metric, MLMAndAALossScalars):
+            metric_result = metric.update(outputs)
+        elif isinstance(metric, PipelineDebugDumpMetric):
+            metric_result = metric.update(outputs)
+        elif getattr(outputs, "ce_loss", False) and isinstance(metric, EfficientCrossEntropy):
             metric_result = metric.update(outputs["ce_loss"])
         elif getattr(outputs, "z_loss", False) and isinstance(metric, EfficientZLoss):
             metric_result = metric.update(outputs["z_loss"])
@@ -469,8 +634,10 @@ class EfficientHuggingFaceModel(HuggingFaceModel):
             metric_result = metric.update(outputs["logits"], outputs.get("labels", self.labels))
 
         if metric_result is not None:
-            # Add the metric name once for each datapoint in the batch
-            metric_result["metric_name"] = [metric.__class__.__name__ for _ in range(0, batch["input_ids"].shape[0])]
+            if isinstance(metric, (PerAALossAndF1, MLMAndAALossScalars, PipelineDebugDumpMetric)):
+                pass
+            else:
+                metric_result["metric_name"] = [metric.__class__.__name__ for _ in range(0, batch["input_ids"].shape[0])]
         else:
             metric_result = {}
         return metric_result
@@ -617,6 +784,118 @@ def create_flex_bert_mlm(
 
     # Padding for divisibility by 8
     # We have to do it again here because wrapping by HuggingFaceModel changes it
+    if config.vocab_size % 8 != 0:
+        config.vocab_size += 8 - (config.vocab_size % 8)
+    hf_model.model.resize_token_embeddings(config.vocab_size)
+
+    return hf_model
+
+
+def create_flex_bert_mlm_aa(
+    pretrained_model_name: str = "bert-base-uncased",
+    model_config: Optional[dict] = None,
+    tokenizer_name: Optional[str] = None,
+    gradient_checkpointing: Optional[bool] = False,
+    pretrained_checkpoint: Optional[str] = None,
+    recompute_metric_loss: Optional[bool] = False,
+    disable_train_metrics: Optional[bool] = False,
+):
+    """FlexBERT MLM with auxiliary per-token AA (BCE) heads. Requires num_aa_labels and aa_loss_weight in model_config.
+
+    If ``model_config["pipeline_debug_dump_path"]`` is set, the first ``pipeline_debug_max_batches`` (default 10)
+    training steps emit ``encoder_inputs_batch_*.npz`` under that directory via :class:`PipelineDebugDumpMetric`
+    (rank 0 only). Use single-process training and ``DataLoader(num_workers=0)`` for predictable dumps.
+    """
+    if not model_config:
+        model_config = {}
+    if "num_aa_labels" not in model_config or model_config["num_aa_labels"] is None:
+        raise ValueError("create_flex_bert_mlm_aa requires model_config.num_aa_labels")
+    if "aa_loss_weight" not in model_config or model_config["aa_loss_weight"] is None:
+        raise ValueError("create_flex_bert_mlm_aa requires model_config.aa_loss_weight")
+
+    if not pretrained_model_name:
+        pretrained_model_name = "bert-base-uncased"
+
+    if isinstance(model_config, DictConfig):
+        model_config = OmegaConf.to_container(model_config, resolve=True)
+
+    config = configuration_bert_module.FlexBertConfig.from_pretrained(pretrained_model_name, **model_config)
+
+    if "prenorm" in config.bert_layer:
+        assert config.final_norm, "Final norm must be used with prenorm attention"
+    else:
+        assert "postnorm" in config.bert_layer, "config.bert_layer str must contain either prenorm or postnorm"
+        assert not config.final_norm, "Final norm should not be used with postnorm attention"
+
+    if config.vocab_size % 8 != 0:
+        config.vocab_size += 8 - (config.vocab_size % 8)
+
+    if pretrained_checkpoint is not None:
+        model = bert_layers_module.FlexBertForMaskedLMwAA.from_composer(
+            pretrained_checkpoint=pretrained_checkpoint, config=config
+        )
+    else:
+        model = bert_layers_module.FlexBertForMaskedLMwAA(config)
+
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()  # type: ignore
+
+    if tokenizer_name:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_name)
+    else:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name)
+
+    num_aa = config.num_aa_labels
+    aa_label_names = model_config.get("aa_label_names")
+    if aa_label_names is None:
+        from src.text_data import NoStreamingGenomeAndProteinDataset
+        assert len(NoStreamingGenomeAndProteinDataset.aa_list) == num_aa - 1, f"num_aa_labels is {num_aa} but the number of amino acids in the dataset is {len(NoStreamingGenomeAndProteinDataset.aa_list)}"
+        aa_label_names = NoStreamingGenomeAndProteinDataset.aa_list[:num_aa - 1] + ["strand"]
+
+    metrics = [MaskedAccuracy(ignore_index=-100)]
+    if recompute_metric_loss or model_config.get("loss_function", "cross_entropy") not in ["fa_cross_entropy", "cross_entropy"]:
+        if CrossEntropyLoss is not None:
+            metrics = [FALanguageCrossEntropy(ignore_index=-100)] + metrics
+        else:
+            metrics = [LanguageCrossEntropy(ignore_index=-100)] + metrics
+    else:
+        metrics = [EfficientCrossEntropy()] + metrics
+    if model_config.get("loss_kwargs", {}).get("return_z_loss", False):
+        metrics += [EfficientZLoss()]
+    metrics += [PerAALossAndF1(aa_label_names=aa_label_names), MLMAndAALossScalars()]
+    if model_config.get("pipeline_debug_dump_path"):
+        metrics += [
+            PipelineDebugDumpMetric(
+                dump_dir=model_config["pipeline_debug_dump_path"],
+                max_batches=model_config.get("pipeline_debug_max_batches", 10),
+            )
+        ]
+    if model_config.get("save_mlm_probs", None) is not None:
+        metrics += [bpLoss(**model_config.get("save_mlm_probs", {}))]
+    if model_config.get("eval_mlm_probs", None) is not None:
+        metrics += [eval_bpLoss(**model_config.get("eval_mlm_probs", {}))]
+
+    eval_metrics = copy.deepcopy(metrics)
+    eval_metrics = [m for m in eval_metrics if m.__class__.__name__ != "bpLoss"]
+    if disable_train_metrics:
+        metrics = [
+            m
+            for m in metrics
+            if m.__class__.__name__
+            in ("bpLoss", "PerAALossAndF1", "MLMAndAALossScalars", "PipelineDebugDumpMetric")
+        ]
+        if len(metrics) == 0:
+            metrics = None
+
+    hf_model = EfficientHuggingFaceModel(
+        model=model,
+        tokenizer=tokenizer,
+        use_logits=True,
+        metrics=metrics,
+        eval_metrics=eval_metrics,
+        allow_embedding_resizing=model.config.allow_embedding_resizing,
+    )
+
     if config.vocab_size % 8 != 0:
         config.vocab_size += 8 - (config.vocab_size % 8)
     hf_model.model.resize_token_embeddings(config.vocab_size)
