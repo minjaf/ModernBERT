@@ -2,12 +2,12 @@ data_local: ./data/metavr/mds/
 data_remote: # If blank, files must be present in data_local
 
 max_seq_len: 1024
-tokenizer_name: ./data/tokenizers/6mer
+tokenizer_name: AIRI-Institute/gena-lm-bert-base-t2t
 mlm_probability: 0.3 # FlexBERT should use 30% masking for optimal performance
 count_padding_tokens: false
 
 # Run Name
-run_name: moderngena-base-metavr-giga
+run_name: moderngena-large-metavr-giga-bpe
 autoresume: true
 
 # Model
@@ -17,12 +17,12 @@ model:
   tokenizer_name: ${tokenizer_name}
   disable_train_metrics: true # save some time by not computing metrics on the training set
   model_config:
-    vocab_size: 5589 # !
+    vocab_size: 32768 # !
     init_method: full_megatron
-    num_hidden_layers: 22
-    hidden_size: 768
-    intermediate_size: 1152
-    num_attention_heads: 12 # to have head size of 64
+    num_hidden_layers: 28
+    hidden_size: 1024
+    intermediate_size: 2624
+    num_attention_heads: 16 # to have head size of 64
     attention_layer: rope
     attention_probs_dropout_prob: 0.0
     attn_out_bias: false
@@ -77,8 +77,9 @@ train_loader:
     streaming: false
     split_as_subsample_from_train_split: 0.99
   drop_last: true
-  num_workers: 6 # !!! change to 6 for production
-  prefetch_factor: 2
+  num_workers: 6 
+  prefetch_factor:  2
+  # persistent_workers: false # debug
   sequence_packing: true
   batch_size_warmup_min_size: ${device_train_microbatch_size}
   batch_size_warmup_tokens: 50_000tok
@@ -129,8 +130,8 @@ global_eval_batch_size: 1024
 
 # System
 seed: 17
-device_eval_batch_size: 2
-device_train_microbatch_size: 2
+device_eval_batch_size: 32
+device_train_microbatch_size: 32
 precision: amp_bf16
 
 # Logging
@@ -154,6 +155,6 @@ loggers:
     log_dir: runs/ # will log to log_dir/run_name
 
 # Checkpoint to local filesystem or remote object store
-save_interval: 100ba
-save_num_checkpoints_to_keep: 5  # Important, this cleans up checkpoints saved to DISK
+save_interval: 200ba
+save_num_checkpoints_to_keep: 3  # Important, this cleans up checkpoints saved to DISK
 save_folder: runs/{run_name}
