@@ -333,6 +333,16 @@ def build_model(cfg: DictConfig):
             recompute_metric_loss=cfg.get("recompute_metric_loss", False),
             disable_train_metrics=cfg.get("disable_train_metrics", False),
         )
+    elif cfg.name == "flex_bert_mlm_aa":
+        return flex_bert_module.create_flex_bert_mlm_aa(
+            pretrained_model_name=cfg.pretrained_model_name,
+            pretrained_checkpoint=cfg.get("pretrained_checkpoint", None),
+            model_config=cfg.get("model_config", None),
+            tokenizer_name=cfg.get("tokenizer_name", None),
+            gradient_checkpointing=cfg.get("gradient_checkpointing", None),
+            recompute_metric_loss=cfg.get("recompute_metric_loss", False),
+            disable_train_metrics=cfg.get("disable_train_metrics", False),
+        )
     else:
         raise ValueError(f"Not sure how to build model with name={cfg.name}")
 
@@ -354,7 +364,15 @@ def init_from_checkpoint(cfg: DictConfig, new_model: nn.Module):
     model_state = state_dict.get("model", {})
     assert len(model_state) > 0, "Model state is empty, please check the checkpoint and checkpoint path"
     if cfg.get("only_load_weights", False):
-        new_model.load_state_dict(model_state, strict=True)
+        # If the checkpoint is from FlexBertForMaskedLM (no AA heads) and
+        # strict=True will fail on the new model. 
+        # Use strict=False when the model is FlexBertForMaskedLMwAA 
+        # (or when the state dict is from a model without AA heads), 
+        # so that only matching keys are loaded and the AA head parameters are left 
+        # as initialized in the new model.
+        strict = not hasattr(new_model.model, "aa_head")
+        
+        new_model.load_state_dict(model_state, strict=strict)
         return
 
     pretrained_model.load_state_dict(model_state)
@@ -478,6 +496,7 @@ def main(cfg: DictConfig, return_trainer: bool = False, do_train: bool = True) -
         autoresume=cfg.get("autoresume", None),
         fsdp_config=cfg.get("fsdp_config", None),
         compile_config=cfg.get("compile_config", None),
+        spin_dataloaders=cfg.get("spin_dataloaders", False)
     )
 
     print("Logging config...")
