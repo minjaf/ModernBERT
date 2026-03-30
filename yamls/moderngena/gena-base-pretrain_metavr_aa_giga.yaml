@@ -6,12 +6,12 @@ data_local: ./data/omg_test/omg-train-00000-of-03789./
 data_remote: # If blank, files must be present in data_local
 
 max_seq_len: 1024
-tokenizer_name: ./data/tokenizers/6mer
+tokenizer_name: AIRI-Institute/gena-lm-bert-base-t2t
 mlm_probability: 0.3 # FlexBERT should use 30% masking for optimal performance
 count_padding_tokens: false
 
 # Run Name
-run_name: moderngena-base-metavr-aa-giga-pipeline-debug
+run_name: moderngena-base-metavr-aa-giga
 autoresume: true
 
 # Model
@@ -19,9 +19,9 @@ model:
   name: flex_bert_mlm_aa # not flex_bert because we need the AA heads
   pretrained_model_name: bert-base-uncased # has to be set to bert-base-uncased legacy reasons
   tokenizer_name: ${tokenizer_name}
-  disable_train_metrics: false # keep metrics + PipelineDebugDumpMetric visible during debug
+  disable_train_metrics: true # save some time by not computing metrics on the training set
   model_config:
-    vocab_size: 5589 # !
+    vocab_size: 32768 # !
     init_method: full_megatron
     num_hidden_layers: 22
     hidden_size: 768
@@ -67,8 +67,8 @@ model:
     num_aa_labels: 26
     aa_loss_weight: 1.0
     # Writes encoder-ready tensors (first N batches) for manual DNA/AA alignment checks
-    pipeline_debug_dump_path: runs/${run_name}/pipeline_debug
-    pipeline_debug_max_batches: 10
+    # pipeline_debug_dump_path: runs/${run_name}/pipeline_debug
+    # pipeline_debug_max_batches: 10
 
 # Dataloaders
 train_loader:
@@ -87,10 +87,9 @@ train_loader:
     streaming: false
     split_as_subsample_from_train_split: 0.99
   drop_last: true
-  num_workers: 0 # required for clean pipeline_debug dumps (avoid duplicate worker batches)
-  persistent_workers: false # ! DEBUG
-  prefetch_factor: null # ! DEBUG 2
-  sequence_packing: false # genome_with_translation does not support sequence packing
+  num_workers: 6 
+  prefetch_factor:  2
+  sequence_packing: false # TODO: test if sequence packing works correctly with the AA heads
   batch_size_warmup_min_size: ${device_train_microbatch_size}
   batch_size_warmup_tokens: 50_000tok
 
@@ -109,9 +108,7 @@ eval_loader:
     streaming: false
     split_as_subsample_from_train_split: 0.99
   drop_last: false
-  num_workers: 0 # ! DEBUG
-  persistent_workers: false # ! DEBUG
-  prefetch_factor: null # ! DEBUG
+  num_workers: 3
   sequence_packing: false
 
 
@@ -134,15 +131,15 @@ optimizer:
   log_grad_norm: true
 
 max_duration: 1_719_000_000_000tok
-eval_interval: 10ba # Debug
-eval_subset_num_batches: 10 # Debug
-global_train_batch_size: 64 # 4608
-global_eval_batch_size: 8 # 1024
+eval_interval: 2000ba
+eval_subset_num_batches: 200
+global_train_batch_size: 4608
+global_eval_batch_size: 1024
 
 # System
 seed: 17
-device_eval_batch_size: 2
-device_train_microbatch_size: 2
+device_eval_batch_size: 64
+device_train_microbatch_size: 64
 precision: amp_bf16
 
 # Logging
