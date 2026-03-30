@@ -375,10 +375,30 @@ class DataCollatorForLanguageModelingWithMLMProbs(transformers.DataCollatorForLa
 
             mlm_efficiency_paths = []
 
-            # remove metadata and mlm_efficiency_path from the example
+            # remove metadata and mlm_efficiency_path from the example (keep a serializable copy for pipeline_debug)
+            pipeline_dataset_meta: list[dict[str, Any]] = []
             for example in examples:
-                if "metadata" in example: 
-                    example.pop("metadata")
+                if "metadata" in example:
+                    md = example.pop("metadata")
+                    pipeline_dataset_meta.append(
+                        {
+                            "dataset_index": int(md.get("index", md.get("dataset_index", -1))),
+                            "shard_sample_id": int(md["shard_sample_id"])
+                            if md.get("shard_sample_id") is not None
+                            else -1,
+                            "shard_index": int(md.get("shard_index", -1)),
+                            "shard_path": str(md.get("shard_path", "")),
+                        }
+                    )
+                else:
+                    pipeline_dataset_meta.append(
+                        {
+                            "dataset_index": -1,
+                            "shard_sample_id": -1,
+                            "shard_index": -1,
+                            "shard_path": "",
+                        }
+                    )
 
                 if "mlm_efficiency_path" in example:
                     mlm_efficiency_path = example.pop("mlm_efficiency_path")
@@ -386,7 +406,8 @@ class DataCollatorForLanguageModelingWithMLMProbs(transformers.DataCollatorForLa
             
             # now handle all tensors
             batch = default_data_collator(examples, self.return_tensors)
-            
+            batch["pipeline_dataset_meta"] = pipeline_dataset_meta
+
             # and keep the mlm_efficiency_path as single value in the batch
             if len(mlm_efficiency_paths) > 0:
                 assert len(set(mlm_efficiency_paths)) == 1, "mlm_efficiency_paths must be the same for all samples in the batch"
@@ -1251,9 +1272,11 @@ class NoStreamingGenomeAndProteinDataset(NoStreamingDataset):
         sample = shard[shard_sample_id]
         result = self._tokenize(sample)
         result["metadata"]["index"] = index
-        result["metadata"]["shard_id"] = shard
-        result["metadata"]["shard_sample_id"] = shard_sample_id
-        
+        result["metadata"]["shard_sample_id"] = int(shard_sample_id)
+        result["metadata"]["shard_index"] = int(shard_id)
+        raw_filename = os.path.join(shard.dirname, shard.split, shard.raw_data.basename)
+        result["metadata"]["shard_path"] = raw_filename
+
         return result
 
 # Helpful to test if your dataloader is working locally

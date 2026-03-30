@@ -11,7 +11,8 @@ from __future__ import annotations
 import copy
 import os
 import sys
-from typing import Any, Dict, Optional
+from collections.abc import Mapping
+from typing import Any, Dict, Literal, Optional, Tuple
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
@@ -47,12 +48,156 @@ try:
 except ImportError:
     CrossEntropyLoss = None
 
-all = [
+__all__ = [
     "create_flex_bert_mlm",
     "create_flex_bert_mlm_aa",
     "create_flex_bert_classification",
     "PipelineDebugDumpMetric",
 ]
+
+
+def _model_output_optional_field(outputs: Any, key: str) -> Any:
+    """Read optional fields from a HF ``ModelOutput``.
+
+    Subclasses are ``Mapping``-like, but attributes set after construction (e.g. ``mlm_loss`` on
+    ``MaskedLMOutput``) are often **not** present in ``.keys()``, so ``outputs.get(key)`` fails.
+    Always try ``getattr`` first, then mapping lookup.
+    """
+    if outputs is None:
+        return None
+    v = getattr(outputs, key, None)
+    if v is not None:
+        return v
+    if isinstance(outputs, Mapping):
+        return outputs.get(key)
+    return None
+
+
+def _prepare_flat_aa_logits_labels_3d(aa_logits: Tensor, aa_labels: Tensor) -> Tuple[Tensor, Tensor]:
+    """Align batch AA labels ``(B, n_aa, S)`` with logits ``(B, S, n_aa)``, then flatten to ``(B*S, n_aa)``."""
+    aa_logits = aa_logits.detach().float()
+    aa_labels = aa_labels.detach().float()
+    assert aa_logits.dim() == 3, f"aa_logits.dim() is {aa_logits.dim()} but expected 3"
+    assert aa_labels.dim() == 3, f"aa_labels.dim() is {aa_labels.dim()} but expected 3"
+    # Labels are (B, n_aa, S); logits are (B, S, n_aa) — permute labels to (B, S, n_aa) to match logits.
+    aa_labels = aa_labels.permute(0, 2, 1).contiguous()
+    assert aa_logits.size() == aa_labels.size(), (
+        f"aa_logits.size() is {aa_logits.size()} but aa_labels.size() is {aa_labels.size()}"
+    )
+    aa_labels = aa_labels.reshape(-1, aa_labels.shape[-1])
+    aa_logits = aa_logits.reshape(-1, aa_logits.shape[-1])
+    return aa_logits, aa_labels
+
+
+class _PerAAHeadMetricBase(Metric):
+    """One amino-acid (or strand) head: Composer needs unique ``__class__.__name__`` per metric instance."""
+
+    full_state_update = False
+    kind: str
+    aa_index: int
+    aa_name: str
+
+
+def _sanitize_metric_class_name(kind: str, aa_index: int, aa_name: str) -> str:
+    safe = "".join(c if c.isalnum() or c in "_" else "_" for c in aa_name.replace("*", "star"))[:48]
+    return f"PerAA_{kind}_{aa_index}_{safe}"[:120]
+
+
+def _make_per_aa_head_metric(kind: Literal["loss", "f1"], aa_index: int, aa_name: str) -> Metric:
+    """Factory: unique subclass name per head so :meth:`HuggingFaceModel._get_metric_dict` does not drop metrics."""
+
+    cname = _sanitize_metric_class_name(kind, aa_index, aa_name)
+
+    if kind == "loss":
+
+        class _Impl(_PerAAHeadMetricBase):
+            def __init__(self, dist_sync_on_step: bool = False):
+                super().__init__(dist_sync_on_step=dist_sync_on_step)
+                self.kind = "loss"
+                self.aa_index = aa_index
+                self.aa_name = aa_name
+                self.add_state("loss_sum", default=torch.tensor(0.0), dist_reduce_fx="sum")
+                self.add_state("loss_count", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+            def update(self, aa_logits: Tensor, aa_labels: Tensor) -> None:
+                if aa_logits is None or aa_labels is None:
+                    return
+                lg, lb = _prepare_flat_aa_logits_labels_3d(aa_logits, aa_labels)
+                i = self.aa_index
+                valid = lb[:, i] != -100
+                if not valid.any():
+                    return
+                logits_i = lg[:, i][valid]
+                labels_i = lb[:, i][valid]
+                if not torch.all((labels_i == 0) | (labels_i == 1)):
+                    return
+                loss_i = torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits_i, labels_i, reduction="mean"
+                )
+                self.loss_sum += loss_i
+                self.loss_count += 1.0
+
+            def compute(self) -> Tensor:
+                if self.loss_count > 0:
+                    return self.loss_sum / self.loss_count
+                return torch.tensor(0.0, device=self.loss_sum.device)
+
+    else:
+
+        class _Impl(_PerAAHeadMetricBase):
+            def __init__(self, dist_sync_on_step: bool = False):
+                super().__init__(dist_sync_on_step=dist_sync_on_step)
+                self.kind = "f1"
+                self.aa_index = aa_index
+                self.aa_name = aa_name
+                self.add_state("tp", default=torch.tensor(0.0), dist_reduce_fx="sum")
+                self.add_state("fp", default=torch.tensor(0.0), dist_reduce_fx="sum")
+                self.add_state("fn", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+            def update(self, aa_logits: Tensor, aa_labels: Tensor) -> None:
+                if aa_logits is None or aa_labels is None:
+                    return
+                lg, lb = _prepare_flat_aa_logits_labels_3d(aa_logits, aa_labels)
+                i = self.aa_index
+                valid = lb[:, i] != -100
+                if not valid.any():
+                    return
+                logits_i = lg[:, i][valid]
+                labels_i = lb[:, i][valid]
+                if not torch.all((labels_i == 0) | (labels_i == 1)):
+                    return
+                pred_i = (logits_i > 0).float()
+                self.tp += ((pred_i == 1) & (labels_i == 1)).sum().float()
+                self.fp += ((pred_i == 1) & (labels_i == 0)).sum().float()
+                self.fn += ((pred_i == 0) & (labels_i == 1)).sum().float()
+
+            def compute(self) -> Tensor:
+                # This is the denominator for the F1 score calculation. The F1 formula here is:
+                #   F1 = tp / (tp + 0.5 * (fp + fn))
+                # which is a mathematically equivalent rearrangement of:
+                #   F1 = 2 * tp / (2 * tp + fp + fn)
+                denom = self.tp + 0.5 * (self.fp + self.fn)
+                if denom > 0:
+                    return self.tp / denom
+                return torch.tensor(0.0, device=self.tp.device)
+
+    _Impl.__name__ = cname
+    _Impl.__qualname__ = cname
+    return _Impl()
+
+
+def build_per_aa_metrics(aa_label_names: list[str], include_f1: bool = True) -> list[Metric]:
+    """Return one BCE-loss metric per label, and optionally one binary-F1 metric per label.
+
+    Each head is a separate :class:`torchmetrics.Metric` subclass with a **unique class name** so
+    :class:`composer.models.huggingface.HuggingFaceModel` does not overwrite entries in ``train_metrics``.
+    """
+    out: list[Metric] = []
+    for i, name in enumerate(aa_label_names):
+        out.append(_make_per_aa_head_metric("loss", i, name))
+        if include_f1:
+            out.append(_make_per_aa_head_metric("f1", i, name))
+    return out
 
 
 # we want the efficent versions to have the same name as the TorchMetrics' name
@@ -478,77 +623,48 @@ class eval_bpLoss(bpLoss):
         self.reset()
 
 
-class PerAALossAndF1(Metric):
-    """Computes per-AA mean BCE loss and binary F1; update() returns a dict of scalars for logging."""
+class MLMLossMetric(Metric):
+    """Running mean of ``outputs.mlm_loss`` (logged on both train and eval; one scalar per metric)."""
 
     full_state_update = False
 
-    def __init__(self, aa_label_names: list, dist_sync_on_step: bool = False):
+    def __init__(self, dist_sync_on_step: bool = False):
         super().__init__(dist_sync_on_step=dist_sync_on_step)
-        self.aa_label_names = list(aa_label_names)
+        self.add_state("sum", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("count", default=torch.tensor(0.0), dist_reduce_fx="sum")
 
-    def update(self, aa_logits: Tensor, aa_labels: Tensor) -> Optional[Dict[str, float]]:
-        """aa_logits: (N, num_aa) or (B, S, num_aa); aa_labels: (N, num_aa) or (B, num_aa, S). Returns dict of aa_loss/NAME and aa_f1/NAME."""
-        if aa_logits is None or aa_labels is None:
-            return None
-        aa_logits = aa_logits.detach().float()
-        aa_labels = aa_labels.detach().float()
-
-        assert aa_logits.dim() == 3, f"aa_logits.dim() is {aa_logits.dim()} but expected 3"
-        assert aa_labels.dim() == 3, f"aa_labels.dim() is {aa_labels.dim()} but expected 3"
-
-        aa_labels = aa_labels.permute(0, 2, 1).contiguous()
-        assert aa_logits.size() == aa_labels.size(), f"aa_logits.size() is {aa_logits.size()} but aa_labels.size() is {aa_labels.size()}"        
-
-        aa_labels = aa_labels.reshape(-1, aa_labels.shape[-1])
-        aa_logits = aa_logits.reshape(-1, aa_logits.shape[-1])
-
-        n_aa = aa_logits.shape[1]
-        result = {}
-        for i in range(n_aa):
-            name = self.aa_label_names[i]
-            valid = aa_labels[:, i] != -100
-            if not valid.any():
-                continue
-            logits_i = aa_logits[:, i][valid]
-            labels_i = aa_labels[:, i][valid]
-            assert torch.all((labels_i == 0) | (labels_i == 1)), (
-                f"PerAALossAndF1: AA labels for head {name!r} must be 0 or 1 on valid positions; "
-                f"got min={labels_i.min().item()}, max={labels_i.max().item()}"
-            )
-            loss_i = torch.nn.functional.binary_cross_entropy_with_logits(logits_i, labels_i, reduction="mean")
-            result[f"aa_loss/{name}"] = loss_i.item()
-            pred_i = (logits_i > 0).float()
-            tp = ((pred_i == 1) & (labels_i == 1)).sum().float()
-            fp = ((pred_i == 1) & (labels_i == 0)).sum().float()
-            fn = ((pred_i == 0) & (labels_i == 1)).sum().float()
-            denom = tp + 0.5 * (fp + fn)
-            f1_i = (tp / denom).item() if denom > 0 else 0.0
-            result[f"aa_f1/{name}"] = f1_i
-        return result if result else None
+    def update(self, outputs: Any) -> None:
+        mlm = _model_output_optional_field(outputs, "mlm_loss")
+        if mlm is not None and torch.is_tensor(mlm):
+            self.sum += mlm.detach().float()
+            self.count += 1.0
 
     def compute(self) -> Tensor:
-        return torch.tensor(0.0)
+        if self.count > 0:
+            return self.sum / self.count
+        return torch.tensor(0.0, device=self.sum.device)
 
 
-class MLMAndAALossScalars(Metric):
-    """Logs scalar `mlm_loss` and aggregated `aa_loss` from FlexBertForMaskedLMwAA outputs (not per-AA)."""
+class AALossMetric(Metric):
+    """Running mean of ``outputs.aa_loss`` (weighted auxiliary BCE; train and eval; one scalar per metric)."""
 
     full_state_update = False
 
-    def update(self, outputs: Any) -> Optional[Dict[str, float]]:
-        """Reads optional `mlm_loss` and `aa_loss` on the model output (same tensors used in the forward loss)."""
-        result: Dict[str, float] = {}
-        mlm = outputs.get("mlm_loss", None) if isinstance(outputs, dict) else getattr(outputs, "mlm_loss", None)
-        aa = outputs.get("aa_loss", None) if isinstance(outputs, dict) else getattr(outputs, "aa_loss", None)
-        if mlm is not None and torch.is_tensor(mlm):
-            result["mlm_loss"] = float(mlm.detach().item())
+    def __init__(self, dist_sync_on_step: bool = False):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+        self.add_state("sum", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("count", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, outputs: Any) -> None:
+        aa = _model_output_optional_field(outputs, "aa_loss")
         if aa is not None and torch.is_tensor(aa):
-            result["aa_loss"] = float(aa.detach().item())
-        return result if result else None
+            self.sum += aa.detach().float()
+            self.count += 1.0
 
     def compute(self) -> Tensor:
-        return torch.tensor(0.0)
+        if self.count > 0:
+            return self.sum / self.count
+        return torch.tensor(0.0, device=self.sum.device)
 
 
 class PipelineDebugDumpMetric(Metric):
@@ -566,9 +682,7 @@ class PipelineDebugDumpMetric(Metric):
         self._saved = 0
 
     def update(self, outputs: Any) -> Optional[Dict[str, float]]:
-        dbg = getattr(outputs, "pipeline_debug", None) if not isinstance(outputs, dict) else outputs.get(
-            "pipeline_debug"
-        )
+        dbg = _model_output_optional_field(outputs, "pipeline_debug")
         if dbg is None:
             return None
         try:
@@ -590,6 +704,10 @@ class PipelineDebugDumpMetric(Metric):
                 continue
             if torch.is_tensor(v):
                 np_dict[k] = v.detach().cpu().numpy()
+            elif isinstance(v, np.ndarray):
+                np_dict[k] = v
+            elif isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v):
+                np_dict[k] = np.array(list(v), dtype=object)
             elif isinstance(v, (int, float, bool)):
                 np_dict[k] = np.array(v)
             elif isinstance(v, str):
@@ -598,7 +716,7 @@ class PipelineDebugDumpMetric(Metric):
         return {"pipeline_debug_dump_saved": 1.0}
 
     def compute(self) -> Tensor:
-        return torch.tensor(0.0)
+        return torch.tensor(float(self._saved))
 
 
 class EfficientHuggingFaceModel(HuggingFaceModel):
@@ -614,11 +732,13 @@ class EfficientHuggingFaceModel(HuggingFaceModel):
         if getattr(metric, "needs_batch", False):
             raise ValueError(f"Unsupported metric {metric=}")
 
-        if isinstance(metric, PerAALossAndF1):
+        if isinstance(metric, _PerAAHeadMetricBase):
             aa_logits = getattr(outputs, "aa_logits", None)
             aa_labels = batch.get("aa_labels", None)
-            metric_result = metric.update(aa_logits, aa_labels) if (aa_logits is not None and aa_labels is not None) else None
-        elif isinstance(metric, MLMAndAALossScalars):
+            metric_result = (
+                metric.update(aa_logits, aa_labels) if (aa_logits is not None and aa_labels is not None) else None
+            )
+        elif isinstance(metric, (MLMLossMetric, AALossMetric)):
             metric_result = metric.update(outputs)
         elif isinstance(metric, PipelineDebugDumpMetric):
             metric_result = metric.update(outputs)
@@ -634,10 +754,7 @@ class EfficientHuggingFaceModel(HuggingFaceModel):
             metric_result = metric.update(outputs["logits"], outputs.get("labels", self.labels))
 
         if metric_result is not None:
-            if isinstance(metric, (PerAALossAndF1, MLMAndAALossScalars, PipelineDebugDumpMetric)):
-                pass
-            else:
-                metric_result["metric_name"] = [metric.__class__.__name__ for _ in range(0, batch["input_ids"].shape[0])]
+            metric_result["metric_name"] = [metric.__class__.__name__ for _ in range(0, batch["input_ids"].shape[0])]
         else:
             metric_result = {}
         return metric_result
@@ -862,7 +979,7 @@ def create_flex_bert_mlm_aa(
         metrics = [EfficientCrossEntropy()] + metrics
     if model_config.get("loss_kwargs", {}).get("return_z_loss", False):
         metrics += [EfficientZLoss()]
-    metrics += [PerAALossAndF1(aa_label_names=aa_label_names), MLMAndAALossScalars()]
+    metrics += [*build_per_aa_metrics(aa_label_names), MLMLossMetric(), AALossMetric()]
     if model_config.get("pipeline_debug_dump_path"):
         metrics += [
             PipelineDebugDumpMetric(
@@ -881,8 +998,8 @@ def create_flex_bert_mlm_aa(
         metrics = [
             m
             for m in metrics
-            if m.__class__.__name__
-            in ("bpLoss", "PerAALossAndF1", "MLMAndAALossScalars", "PipelineDebugDumpMetric")
+            if m.__class__.__name__ in ("bpLoss", "MLMLossMetric", "AALossMetric", "PipelineDebugDumpMetric")
+            or isinstance(m, _PerAAHeadMetricBase)
         ]
         if len(metrics) == 0:
             metrics = None

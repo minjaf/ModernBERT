@@ -50,7 +50,7 @@ import os
 import sys
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 # Add folder root to path to allow us to use relative imports regardless of what directory the script is run from
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
@@ -1315,6 +1315,7 @@ class FlexBertForMaskedLMwAA(FlexBertForMaskedLM):
         max_seqlen: Optional[int],
         batch_size: Optional[int],
         seq_len: Optional[int],
+        pipeline_dataset_meta: Sequence[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
         """Tensors exactly as passed to `self.bert` plus AA tensors aligned to future `aa_head` output."""
         dump_path = getattr(self.config, "pipeline_debug_dump_path", None)
@@ -1343,6 +1344,17 @@ class FlexBertForMaskedLMwAA(FlexBertForMaskedLM):
         snap["batch_size"] = int(batch_size) if batch_size is not None else -1
         snap["seq_len"] = int(seq_len) if seq_len is not None else -1
         snap["encoder_layout"] = "unpadded" if indices is not None else "padded"
+        if pipeline_dataset_meta:
+            snap["meta_dataset_index"] = torch.tensor(
+                [int(m.get("dataset_index", -1)) for m in pipeline_dataset_meta], dtype=torch.long
+            )
+            snap["meta_shard_sample_id"] = torch.tensor(
+                [int(m.get("shard_sample_id", -1)) for m in pipeline_dataset_meta], dtype=torch.long
+            )
+            snap["meta_shard_index"] = torch.tensor(
+                [int(m.get("shard_index", -1)) for m in pipeline_dataset_meta], dtype=torch.long
+            )
+            snap["meta_shard_path"] = [str(m.get("shard_path", "")) for m in pipeline_dataset_meta]
         return snap
 
     def _aa_bce_loss(self, aa_logits: torch.Tensor, aa_labels_aligned: torch.Tensor) -> torch.Tensor:
@@ -1398,9 +1410,14 @@ class FlexBertForMaskedLMwAA(FlexBertForMaskedLM):
         batch_size: Optional[int] = None,
         seq_len: Optional[int] = None,
         aa_labels: Optional[torch.Tensor] = None,
+        # Must be a named parameter (not only **kwargs): Composer HuggingFaceModel.forward passes only keys in
+        # inspect.signature(model.forward).parameters, so collator-provided batch fields would otherwise be dropped.
+        pipeline_dataset_meta: Optional[List[Dict[str, Any]]] = None,
         **kwargs,
     ) -> Union[Tuple[torch.Tensor], MaskedLMOutput]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        if pipeline_dataset_meta is None:
+            pipeline_dataset_meta = kwargs.pop("pipeline_dataset_meta", None)
 
         # --- Unpad (optional): same layout as FlexBertForMaskedLM for ids, MLM labels, and aa_labels ---
         if self.unpad_embeddings and (indices is None and cu_seqlens is None and max_seqlen is None):
@@ -1421,6 +1438,7 @@ class FlexBertForMaskedLMwAA(FlexBertForMaskedLM):
             max_seqlen,
             batch_size,
             seq_len,
+            pipeline_dataset_meta=pipeline_dataset_meta,
         )
 
         encoder_out_full = self.bert(

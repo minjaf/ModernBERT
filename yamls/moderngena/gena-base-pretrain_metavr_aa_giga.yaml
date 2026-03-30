@@ -134,8 +134,8 @@ optimizer:
   log_grad_norm: true
 
 max_duration: 1_719_000_000_000tok
-eval_interval: 2000ba
-eval_subset_num_batches: 200
+eval_interval: 10ba # Debug
+eval_subset_num_batches: 10 # Debug
 global_train_batch_size: 64 # 4608
 global_eval_batch_size: 8 # 1024
 
