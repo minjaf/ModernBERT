@@ -1307,6 +1307,7 @@ class FlexBertForMaskedLMwAA(FlexBertForMaskedLM):
     def _take_pipeline_debug_snapshot(
         self,
         input_ids: torch.Tensor,
+        labels: torch.Tensor,
         aa_labels: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
@@ -1327,6 +1328,8 @@ class FlexBertForMaskedLMwAA(FlexBertForMaskedLM):
             return None
         snap: Dict[str, Any] = {"batch_idx": int(n)}
         snap["input_ids"] = input_ids.detach().cpu()
+        if labels is not None:
+            snap["labels"] = labels.detach().cpu()
         if aa_labels is not None:
             snap["aa_labels"] = aa_labels.detach().cpu()
             snap["aa_labels_aligned_for_loss"] = self._preview_aa_labels_aligned_for_loss(
@@ -1430,6 +1433,7 @@ class FlexBertForMaskedLMwAA(FlexBertForMaskedLM):
 
         pipeline_debug = self._take_pipeline_debug_snapshot(
             input_ids,
+            labels,
             aa_labels,
             attention_mask,
             position_ids,
