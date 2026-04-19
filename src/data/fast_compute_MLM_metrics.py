@@ -1,10 +1,21 @@
 # Run like this:
-# CUDA_VISIBLE_DEVICES=1 python src/data/fast_compute_MLM_metrics.py --batch_size 96 --num_workers 8 --mlm_efficiency_path runs/test/mlm_efficiency/ --append_mlm_efficiency --job_number 1
+# CUDA_VISIBLE_DEVICES=1 python src/data/fast_compute_MLM_metrics.py --job_number 1 --batch_size 96 --num_workers 8 --mlm_efficiency_path runs/test/mlm_efficiency/ --append_mlm_efficiency
 # or
 # composer src/data/fast_compute_MLM_metrics.py ...
 # or for many jobs:
-# for i in {2..100}; do CUDA_VISIBLE_DEVICES=1 python src/data/fast_compute_MLM_metrics.py --batch_size 96 --num_workers 8 --mlm_efficiency_path runs/test/mlm_efficiency/ --append_mlm_efficiency --job_number ${i}; done
-# for i in {101..200}; do CUDA_VISIBLE_DEVICES=0 python src/data/fast_compute_MLM_metrics.py --batch_size 96 --num_workers 8 --mlm_efficiency_path runs/test/mlm_efficiency/ --append_mlm_efficiency --job_number ${i}; done
+# tmux new -s jobs201_299
+# conda activate bert24
+# cd ~/DNALM/ModernBERT/
+# for i in {201..299}; do date; echo "$i --> $(date)" >> runs/tmp.log; CUDA_VISIBLE_DEVICES=0 python src/data/fast_compute_MLM_metrics.py  --job_number ${i} --batch_size 96 --num_workers 8 --mlm_efficiency_path runs/test/mlm_efficiency/ --append_mlm_efficiency; done
+# for i in {2..100}; do CUDA_VISIBLE_DEVICES=0 python src/data/fast_compute_MLM_metrics.py --job_number ${i} --batch_size 96 --num_workers 8 --mlm_efficiency_path runs/test/mlm_efficiency/ --append_mlm_efficiency; done
+# for i in {101..200}; do CUDA_VISIBLE_DEVICES=1 python src/data/fast_compute_MLM_metrics.py  --job_number ${i} --batch_size 96 --num_workers 8 --mlm_efficiency_path runs/test/mlm_efficiency/ --append_mlm_efficiency; done
+###
+# to download checkpoint:
+# mkdir -p runs/moderngena-base-pretrain-promoters_multi_v2_resume_ep129-ba379400/
+# cd runs/moderngena-base-pretrain-promoters_multi_v2_resume_ep129-ba379400/
+# aws s3 cp s3://genalm/runs/moderngena-base-pretrain-promoters_multi_v2_resume_ep129-ba379400/cfg.yaml . --profile airi --endpoint-url https://s3.cloud.ru
+# aws s3 cp s3://genalm/runs/moderngena-base-pretrain-promoters_multi_v2_resume_ep129-ba379400/ep159-ba468300-rank0.pt . --profile airi --endpoint-url https://s3.cloud.ru
+# cd ../..
 
 import os
 import argparse
