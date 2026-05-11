@@ -821,6 +821,9 @@ class NoStreamingGenomeDataset(NoStreamingDataset):
         else:
             assert not split_as_subsample_from_train_split, "split_as_subsample_from_train_split must be a float between 0 and 1 or False"
             super().__init__(local, split, max_seq_len, tokenizer, pad_sequences)
+            # Default branch must also initialize the attribute so that __len__ / __getitem__
+            # do not raise AttributeError. (`split` is only consulted when this is truthy.)
+            self.split_as_subsample_from_train_split = False
 
         # todo: add seed and check that its ok for multiple workers
         self.augment_rc = augment_rc
@@ -1122,6 +1125,9 @@ class NoStreamingGenomeAndProteinDataset(NoStreamingDataset):
         else:
             assert not split_as_subsample_from_train_split, "split_as_subsample_from_train_split must be a float between 0 and 1 or False"
             super().__init__(local, split, max_seq_len, tokenizer, pad_sequences)
+            # Default branch must also initialize the attribute so that __len__ / __getitem__
+            # do not raise AttributeError. (`split` is only consulted when this is truthy.)
+            self.split_as_subsample_from_train_split = False
 
         # todo: add seed and check that its ok for multiple workers
         self.augment_rc = augment_rc
