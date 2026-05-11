@@ -613,6 +613,110 @@ def test_split_packed_batch():
     pass
 
 
+def test_packer_adaptive_masking_branch():
+    """When ``adaptive_masking=True`` the packer must yield raw, unmasked
+    ``input_ids``, ``labels=None``, and a ``maskable_mask`` field that is
+    1 everywhere except at padding positions."""
+    input_batch_size = 4
+    xds = [{"input_ids": seq} for seq in xs]
+    input_batches = list(batched(xds, input_batch_size))
+    d = {
+        "src_iterable": input_batches,
+        "src_batch_size": input_batch_size,
+        "src_max_seq_len": max_seq_len,
+        "out_batch_size": 5,
+        "out_pseq_len": 15,
+        "buffer_size": 5,
+        "pad_token_id": -1,
+        "mask_token_id": -2,
+        "ignore_token_id": -3,
+        "mask_prob": 0.5,  # should be ignored when adaptive_masking=True
+        "seed": 42,
+        "suppress_masking": False,
+        "adaptive_masking": True,
+    }
+
+    out_batches = list(GreedyBestFitSequencePacker(**d))
+    assert len(out_batches) > 0
+
+    for batch in out_batches:
+        # labels are not produced by the packer in this mode
+        assert batch["labels"] is None
+        # input_ids are the packed, *unmasked* sequence (no special replacement values)
+        ids = batch["input_ids"]
+        mask_token = -2
+        assert (ids != mask_token).all(), "input_ids must not contain the mask token in adaptive mode"
+        # attention_mask = 0 iff pad
+        assert torch.equal(batch["attention_mask"], (ids != -1).to(batch["attention_mask"].dtype))
+        # maskable_mask = 1 iff non-pad (single-sequence packing has no CLS/SEP)
+        assert torch.equal(batch["maskable_mask"], (ids != -1))
+        # required structural fields
+        assert "cu_seqlens" in batch
+        assert "max_seqlen" in batch
+
+
+def test_packer_adaptive_and_suppress_masking_mutually_exclusive():
+    input_batches = [[{"input_ids": [1, 2, 3]}]]
+    with __import__("pytest").raises(ValueError, match="mutually exclusive"):
+        GreedyBestFitSequencePacker(
+            src_iterable=input_batches,
+            src_batch_size=1,
+            src_max_seq_len=max_seq_len,
+            out_batch_size=1,
+            out_pseq_len=15,
+            buffer_size=1,
+            pad_token_id=-1,
+            mask_token_id=-2,
+            ignore_token_id=-3,
+            mask_prob=0.5,
+            seed=42,
+            suppress_masking=True,
+            adaptive_masking=True,
+        )
+
+
+def test_split_packed_batch_carries_maskable_mask_and_handles_none_labels():
+    """``split_packed_batch`` must (a) propagate the new ``maskable_mask``
+    field per microbatch and (b) tolerate ``labels=None`` (adaptive mode)."""
+    batch = {
+        "input_ids": tensor(
+            [
+                [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 8, 8],
+                [5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, -1, -1],
+            ]
+        ),
+        "labels": None,
+        "cu_seqlens": [
+            tensor([0, 10, 13, 15], dtype=torch.int32),
+            tensor([0, 6, 13, 15], dtype=torch.int32),
+        ],
+        "max_seqlen": [10, 7],
+        "attention_mask": tensor(
+            [
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
+            ]
+        ),
+        "maskable_mask": tensor(
+            [
+                [True] * 15,
+                [True] * 13 + [False, False],
+            ]
+        ),
+    }
+
+    out = split_packed_batch(batch, 2, padding_tolerance=1.0)
+    assert len(out) == 2
+
+    # Each item: labels stays None, maskable_mask preserved (same shape as input_ids).
+    for item in out:
+        assert item["labels"] is None
+        assert "maskable_mask" in item
+        assert item["maskable_mask"].shape == item["input_ids"].shape
+        # maskable_mask matches "non-pad" for this construction.
+        assert torch.equal(item["maskable_mask"], item["attention_mask"].bool())
+
+
 def test_split_packed_batch_strip_padding():
     input_batches = [
         {

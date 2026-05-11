@@ -1,30 +1,40 @@
-# data_local: ./human_t2t_1k
+# Mirrors `gena-base-pretrain_multi_promoters.yaml` with two changes:
+#   1) Online adaptive ("hardest-token") MLM masking is ENABLED.
+#   2) `autoresume: true` — resumes from the latest checkpoint in `save_folder`
+#      automatically (Composer feature; requires a stable `run_name` and an
+#      existing/creatable `save_folder`).
+#
+# Notes:
+#   * Adaptive masking runs a second no-grad forward per microbatch (encoder + MLM head),
+#     so per-step FLOPs ~= 2x vanilla. Use `adaptive_masking.recompute_every_n_steps > 1`
+#     to amortize. `recompute_every_n_steps=1` matches the user's request literally
+#     ("on each step ... run the forward pass with no masking ... then run normal forward").
+#   * `compile_model: true` is kept (matches the original config). The scoring forward feeds
+#     the full hidden states to the compiled head while the training forward feeds the
+#     masked subset, so torch.compile (dynamic=True) will recompile once on each shape.
+
 data_local: ./data/promoters_mds_full/
 data_remote: # If blank, files must be present in data_local
 
 max_seq_len: 1024
 tokenizer_name: AIRI-Institute/gena-lm-bert-base-t2t
-mlm_probability: 0.3 # FlexBERT should use 30% masking for optimal performance
+mlm_probability: 0.3
 count_padding_tokens: false
 
 # Online adaptive ("hardest-token") MLM masking.
-# When enabled, the data pipeline emits raw (unmasked) tokens and the model wrapper
-# runs an extra no-grad forward to score each token, then masks the per-row
-# top-K hardest ones (with a small random tail for exploration). Doubles per-step
-# forward FLOPs unless `recompute_every_n_steps` > 1.
 adaptive_masking:
-  enabled: false                  # master switch (off by default; keeps existing behaviour)
-  selection_mode: topk            # only "topk" is implemented in this PR
-  random_fraction: 0.1            # fraction of masked positions drawn uniformly at random
-  warmup_batches: 0               # number of microbatches to use random masking before adaptive kicks in
-  recompute_every_n_steps: 1      # > 1 amortises the extra forward over multiple microbatches
+  enabled: true                   # MAIN CHANGE vs. the original config
+  selection_mode: topk
+  random_fraction: 0.1            # 10% of masked positions chosen uniformly at random (exploration)
+  warmup_batches: 0               # use adaptive from step 0
+  recompute_every_n_steps: 1      # do the scoring forward on every step (matches the request)
   use_eval_mode_for_scoring: true # disable dropout during the scoring forward
   bert_replacement: true          # apply the 80% [MASK] / 10% random / 10% keep recipe
-  apply_at_eval: false            # eval uses random masking by default (consistent comparison)
-  score: one_minus_p_correct      # "one_minus_p_correct" | "neg_log_p_correct"
+  apply_at_eval: false            # eval continues to use random masking for consistent comparison
+  score: one_minus_p_correct
 
-# Run Name
-run_name: moderngena-base-pretrain-promoters_multi
+# Run Name (kept distinct from the baseline run so autoresume picks the right folder).
+run_name: moderngena-base-pretrain-promoters_multi_adaptive
 
 # Model
 model:
@@ -173,10 +183,13 @@ loggers:
   tensorboard:
     log_dir: runs/ # will log to log_dir/run_name
 
-# Checkpoint to local filesystem or remote object store
+# Checkpoint to local filesystem.
 save_interval: 100ba
-save_num_checkpoints_to_keep: 5  # Important, this cleans up checkpoints saved to DISK
+save_num_checkpoints_to_keep: 5  # cleans up older checkpoints on disk
 save_folder: runs/{run_name}
 
-# Load from local filesystem or remote object store to
-# load_path: null
+# Autoresume: Composer will scan `save_folder` for the latest checkpoint and pick up
+# where it left off (training duration, optimizer state, dataset state, etc.).
+# `save_overwrite: false` is required so the resumed run does not clobber prior shards.
+autoresume: true
+save_overwrite: false

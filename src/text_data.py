@@ -588,6 +588,13 @@ def build_text_dataloader(
             + "argument when creating your MDS dataset with convert_dataset.py"
         )
     use_sequence_packing = cfg.get("sequence_packing", False)
+    adaptive_masking_enabled = bool(cfg.get("adaptive_masking_enabled", False))
+    if adaptive_masking_enabled and not use_sequence_packing:
+        raise NotImplementedError(
+            "Online adaptive (hardest-token) MLM masking is currently only implemented for the "
+            "sequence-packing data path. Set `train_loader.sequence_packing: true` or disable "
+            "`adaptive_masking`."
+        )
     if cfg.dataset.get("streaming", True):
         dataset = build_streaming_dataset(cfg, tokenizer, pad_sequences=not use_sequence_packing,
                                           device_batch_size=device_batch_size)
@@ -663,10 +670,18 @@ def build_text_dataloader(
             batch_size_warmup_min_size=cfg.get("batch_size_warmup_min_size", None),
             batch_size_warmup_tokens=cfg.get("batch_size_warmup_tokens", None),
             world_size=dist.get_world_size(),
+            adaptive_masking=adaptive_masking_enabled,
         )
         buffered_iterable = BufferedIterable(sequence_packer, buffer_size=cfg.get("packing_prefetch_factor", 5))
         return buffered_iterable
     else:
+        if adaptive_masking_enabled:
+            # Defense in depth: the guard above already covers this, but keep an
+            # explicit raise here in case a caller bypasses the top of the function.
+            raise NotImplementedError(
+                "Online adaptive (hardest-token) MLM masking is currently only implemented for the "
+                "sequence-packing data path."
+            )
         collate_fn = DataCollatorForLanguageModelingWithMLMProbs(
             tokenizer=dataset.tokenizer, mlm=mlm_probability is not None, mlm_probability=mlm_probability
         )

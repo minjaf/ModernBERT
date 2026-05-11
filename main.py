@@ -390,6 +390,36 @@ def init_from_checkpoint(cfg: DictConfig, new_model: nn.Module):
     print(f"Initalized model from checkpoint {cfg.checkpoint_run_name} with {n_params=:.4e} parameters")
 
 
+def _wire_adaptive_masking(cfg: DictConfig) -> None:
+    """Top-level `adaptive_masking:` block is the single source of truth.
+
+    When enabled, we mirror the block into ``cfg.model.model_config`` (so the
+    model wrapper can build the :class:`AdaptiveMasker`) and set a single
+    ``adaptive_masking_enabled: true`` flag on ``cfg.train_loader`` (so the
+    sequence packer bypasses its built-in random MLM masking).
+    """
+    am_cfg = cfg.get("adaptive_masking", None)
+    if am_cfg is None:
+        return
+    am_container = OmegaConf.to_container(am_cfg, resolve=True) if isinstance(am_cfg, DictConfig) else dict(am_cfg)
+    if not am_container.get("enabled", False):
+        return
+    if "mlm_probability" not in cfg:
+        raise ValueError("adaptive_masking is enabled but `mlm_probability` is missing from the top-level config.")
+    # ---- mirror into model_config (read by create_flex_bert_mlm) ----
+    if "model_config" not in cfg.model or cfg.model.model_config is None:
+        cfg.model.model_config = OmegaConf.create({})
+    cfg.model.model_config["adaptive_masking"] = OmegaConf.create(am_container)
+    cfg.model.model_config["mlm_probability"] = float(cfg.mlm_probability)
+    cfg.model.model_config["adaptive_masking_seed"] = int(cfg.get("seed", 0))
+    # ---- one bool flag for the train loader ----
+    cfg.train_loader["adaptive_masking_enabled"] = True
+    print(
+        "Adaptive (hardest-token) MLM masking is ENABLED with config:\n"
+        f"  {am_container}"
+    )
+
+
 def main(cfg: DictConfig, return_trainer: bool = False, do_train: bool = True) -> Optional[Trainer]:
     print("Training using config: ")
     print(om.to_yaml(cfg))
@@ -397,6 +427,8 @@ def main(cfg: DictConfig, return_trainer: bool = False, do_train: bool = True) -
 
     # Get batch size info
     cfg = update_batch_size_info(cfg)
+
+    _wire_adaptive_masking(cfg)
 
     # Build Model
     print("Initializing model...")

@@ -27,6 +27,7 @@ from omegaconf import DictConfig, OmegaConf
 
 import src.bert_layers as bert_layers_module
 import src.bert_layers.configuration_bert as configuration_bert_module
+from src.adaptive_masking import AdaptiveMasker, AdaptiveMaskingConfig, compute_hardness_scores
 import transformers
 from composer.metrics.nlp import BinaryF1Score, LanguageCrossEntropy, MaskedAccuracy
 from composer.models.huggingface import HuggingFaceModel
@@ -720,6 +721,188 @@ class PipelineDebugDumpMetric(Metric):
 
 
 class EfficientHuggingFaceModel(HuggingFaceModel):
+    """Composer wrapper around FlexBertForMaskedLM.
+
+    Adds an *optional* on-line adaptive ("hardest-token") MLM masking
+    step. When ``adaptive_masking_cfg.enabled`` is true AND the incoming
+    batch carries a ``maskable_mask`` field (i.e. the data pipeline was
+    configured to deliver raw, unmasked tokens), :meth:`forward` runs a
+    no-grad scoring pass to obtain per-token probabilities, picks the
+    hardest tokens, applies the BERT 80/10/10 corruption, and only then
+    runs the standard training forward. When disabled or when the batch
+    does not carry ``maskable_mask`` (e.g. eval, or vanilla MLM runs),
+    the wrapper falls back to the parent's behaviour, so this change is
+    a no-op for existing configurations.
+    """
+
+    def __init__(
+        self,
+        *args,
+        adaptive_masking_cfg: Optional[AdaptiveMaskingConfig] = None,
+        mlm_probability: Optional[float] = None,
+        adaptive_masking_seed: int = 0,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._mlm_probability = mlm_probability
+        self._adaptive_step_counter = 0  # microbatch-level counter
+
+        self.adaptive_masker: Optional[AdaptiveMasker] = None
+        if adaptive_masking_cfg is not None and adaptive_masking_cfg.enabled:
+            if mlm_probability is None:
+                raise ValueError(
+                    "adaptive_masking is enabled but mlm_probability was not provided to "
+                    "EfficientHuggingFaceModel; pass `mlm_probability=<float>`."
+                )
+            tok = self.tokenizer
+            if tok is None or tok.mask_token_id is None:
+                raise ValueError("adaptive_masking requires a tokenizer with a defined mask_token_id.")
+            self.adaptive_masker = AdaptiveMasker(
+                cfg=adaptive_masking_cfg,
+                mask_token_id=int(tok.mask_token_id),
+                vocab_size=int(self.model.config.vocab_size),
+                seed=int(adaptive_masking_seed),
+            )
+
+    # ------------------------------------------------------------------
+    # adaptive masking
+    # ------------------------------------------------------------------
+    def _adaptive_active(self, batch: Mapping) -> bool:
+        """Decide whether to run the adaptive scoring+masking pipeline for this batch.
+
+        We require BOTH a configured masker AND the pipeline to have
+        delivered a ``maskable_mask`` — this keeps eval (which uses the
+        non-adaptive loader) and any legacy code path unaffected.
+        """
+        if self.adaptive_masker is None:
+            return False
+        if not isinstance(batch, Mapping):
+            return False
+        return batch.get("maskable_mask", None) is not None
+
+    @torch.no_grad()
+    def _score_unmasked(
+        self,
+        scoring_batch: Dict[str, Any],
+        target_ids_2d: Tensor,
+        maskable_2d: Tensor,
+    ) -> Tensor:
+        """Run a no-grad forward on the *unmasked* tokens and return per-token hardness scores.
+
+        Returns:
+            ``(B, S)`` float32 tensor with score = ``1 - p(true)`` (or
+            ``-log p(true)`` if so configured), and ``-inf`` at
+            non-maskable positions.
+        """
+        assert self.adaptive_masker is not None
+        B, S = target_ids_2d.shape
+
+        was_training = self.model.training
+        if self.adaptive_masker.cfg.use_eval_mode_for_scoring:
+            self.model.eval()
+        try:
+            # ``super().forward`` filters the batch by the model's forward signature, so passing
+            # ``labels=None`` is enough to disable the ``masked_prediction`` filter and get
+            # logits at every position. ``maskable_mask`` is not a model arg and gets dropped.
+            out = HuggingFaceModel.forward(self, scoring_batch)
+            logits = out.logits
+        finally:
+            if was_training:
+                self.model.train()
+
+        # Reshape ``logits`` to (B, S, V). The packed path returns 1D-flat logits whose first
+        # dim equals B*S (since ``unpad_inputs`` is skipped when cu_seqlens is supplied).
+        if logits.dim() == 2:
+            if logits.shape[0] != B * S:
+                raise RuntimeError(
+                    "adaptive_masking expected the scoring forward to return logits aligned "
+                    f"with the input layout (B*S = {B * S}), but got logits.shape = "
+                    f"{tuple(logits.shape)}. This typically means the model returned padded "
+                    "logits with `indices`-based unpadding; that code path is not yet wired "
+                    "for adaptive masking."
+                )
+            logits = logits.view(B, S, -1)
+        elif logits.dim() == 3:
+            if logits.shape[:2] != (B, S):
+                raise RuntimeError(
+                    f"adaptive_masking: scoring forward returned logits of shape "
+                    f"{tuple(logits.shape)}, expected leading dims {(B, S)}."
+                )
+        else:
+            raise RuntimeError(
+                f"adaptive_masking: unexpected logits dim {logits.dim()} from scoring forward."
+            )
+
+        return compute_hardness_scores(
+            logits=logits,
+            target_ids=target_ids_2d,
+            maskable_mask=maskable_2d,
+            score=self.adaptive_masker.cfg.score,
+        )
+
+    def _adaptive_forward(self, batch: Dict[str, Any]) -> Any:
+        """Score, select, mask, then run the standard training forward."""
+        assert self.adaptive_masker is not None
+        assert self._mlm_probability is not None
+
+        input_ids = batch["input_ids"]
+        maskable = batch["maskable_mask"]
+        if maskable.dtype != torch.bool:
+            maskable = maskable.to(dtype=torch.bool)
+        if maskable.device != input_ids.device:
+            maskable = maskable.to(device=input_ids.device)
+
+        # Add a leading batch dim if the pipeline delivered a 1D microbatch (packed path).
+        squeeze_back = input_ids.dim() == 1
+        input_ids_2d = input_ids.unsqueeze(0) if squeeze_back else input_ids
+        maskable_2d = maskable.unsqueeze(0) if squeeze_back else maskable
+
+        cfg = self.adaptive_masker.cfg
+        step = self._adaptive_step_counter
+        do_adaptive = (
+            (self.training or cfg.apply_at_eval)
+            and step >= cfg.warmup_batches
+            and (step % cfg.recompute_every_n_steps == 0)
+        )
+
+        if do_adaptive:
+            # Build a *scoring* batch with labels=None (so the model skips the masked_prediction
+            # filter) and with the maskable_mask removed (the model's forward does not accept it).
+            scoring_batch: Dict[str, Any] = {k: v for k, v in batch.items() if k != "maskable_mask"}
+            scoring_batch["labels"] = None
+            scores = self._score_unmasked(scoring_batch, input_ids_2d, maskable_2d)
+        else:
+            # Random scores -> falls back to uniform-random selection (still constrained to
+            # maskable positions and still produces the 80/10/10 corruption).
+            scores = torch.empty(input_ids_2d.shape, dtype=torch.float32, device=input_ids.device)
+            scores.uniform_(0.0, 1.0)
+            scores = scores.masked_fill(~maskable_2d, float("-inf"))
+
+        masked_2d, labels_2d = self.adaptive_masker.select_and_mask(
+            input_ids=input_ids_2d,
+            maskable_mask=maskable_2d,
+            scores=scores,
+            mlm_probability=float(self._mlm_probability),
+        )
+
+        masked_input_ids = masked_2d.squeeze(0) if squeeze_back else masked_2d
+        labels = labels_2d.squeeze(0) if squeeze_back else labels_2d
+
+        # Final, masked, training forward. We pop ``maskable_mask`` since the underlying model
+        # does not accept it; ``super().forward`` would filter it anyway, but being explicit is
+        # cheaper than relying on signature filtering.
+        train_batch: Dict[str, Any] = {k: v for k, v in batch.items() if k != "maskable_mask"}
+        train_batch["input_ids"] = masked_input_ids
+        train_batch["labels"] = labels
+
+        self._adaptive_step_counter += 1
+        return HuggingFaceModel.forward(self, train_batch)
+
+    def forward(self, batch):
+        if not self._adaptive_active(batch):
+            return super().forward(batch)
+        return self._adaptive_forward(dict(batch))
+
     def eval_forward(self, batch, outputs: Optional[Any] = None):
         outputs = self.forward(batch) if outputs is None else outputs
         self.labels = batch.pop("labels")
@@ -890,6 +1073,10 @@ def create_flex_bert_mlm(
         if len(metrics) == 0:
             metrics = None
 
+    adaptive_cfg = AdaptiveMaskingConfig.from_dict(model_config.get("adaptive_masking", None))
+    adaptive_mlm_probability = model_config.get("mlm_probability", None) if adaptive_cfg.enabled else None
+    adaptive_seed = int(model_config.get("adaptive_masking_seed", 0))
+
     hf_model = EfficientHuggingFaceModel(
         model=model,
         tokenizer=tokenizer,
@@ -897,6 +1084,9 @@ def create_flex_bert_mlm(
         metrics=metrics,
         eval_metrics=eval_metrics,
         allow_embedding_resizing=model.config.allow_embedding_resizing,
+        adaptive_masking_cfg=adaptive_cfg,
+        mlm_probability=adaptive_mlm_probability,
+        adaptive_masking_seed=adaptive_seed,
     )
 
     # Padding for divisibility by 8
@@ -1004,6 +1194,10 @@ def create_flex_bert_mlm_aa(
         if len(metrics) == 0:
             metrics = None
 
+    adaptive_cfg = AdaptiveMaskingConfig.from_dict(model_config.get("adaptive_masking", None))
+    adaptive_mlm_probability = model_config.get("mlm_probability", None) if adaptive_cfg.enabled else None
+    adaptive_seed = int(model_config.get("adaptive_masking_seed", 0))
+
     hf_model = EfficientHuggingFaceModel(
         model=model,
         tokenizer=tokenizer,
@@ -1011,6 +1205,9 @@ def create_flex_bert_mlm_aa(
         metrics=metrics,
         eval_metrics=eval_metrics,
         allow_embedding_resizing=model.config.allow_embedding_resizing,
+        adaptive_masking_cfg=adaptive_cfg,
+        mlm_probability=adaptive_mlm_probability,
+        adaptive_masking_seed=adaptive_seed,
     )
 
     if config.vocab_size % 8 != 0:

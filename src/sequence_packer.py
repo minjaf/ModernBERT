@@ -89,6 +89,7 @@ class SequencePacker(ABC):
         batch_size_warmup_min_size: Optional[int] = None,
         batch_size_warmup_tokens: Optional[Union[str, Time]] = None,
         world_size: int = 1,
+        adaptive_masking: bool = False,
     ):
         """
         Takes batches of unpacked, unpadded sequences (seqs) to batches of packed and padded sequences (pseqs).
@@ -131,7 +132,16 @@ class SequencePacker(ABC):
             batch_size_warmup_tokens: If not None, the sequence packer will gradually increase the batch size from batch_size_warmup_min_size to out_batch_size over the course of the warmup_tokens.
 
             world_size: The number of processes participating in this training run. batch_size_warmup_min_size is divided by this number.
+
+            adaptive_masking: If True, skip random MLM masking inside the packer and instead emit
+                raw (unmasked) `input_ids` together with a `maskable_mask` field. The downstream
+                model wrapper is then responsible for running a no-grad scoring forward and
+                producing the masked `input_ids` / `labels` on-line. Mutually exclusive with
+                `suppress_masking=True` (this path is an explicit "skip masking" variant that
+                also carries the maskable mask). Cannot be combined with `suppress_masking`.
         """
+        if adaptive_masking and suppress_masking:
+            raise ValueError("adaptive_masking and suppress_masking are mutually exclusive.")
         assert buffer_size >= out_batch_size, f"required that {buffer_size=} >= {out_batch_size=}"
         self.src_dataloader_len = len(src_iterable)
         self.src_iterable = src_iterable
@@ -144,6 +154,7 @@ class SequencePacker(ABC):
         self.ignore_token_id = ignore_token_id
         self.mask_prob = mask_prob
         self.suppress_masking = suppress_masking
+        self.adaptive_masking = adaptive_masking
         # internals
         self.buffer = deque()  # internal buffer holds individual seqs, as tensors.
         # for stats to report packing efficiency.
@@ -260,6 +271,21 @@ class SequencePacker(ABC):
                     "cu_seqlens": cu_seq_lens,
                     "max_seqlen": max_seq_lens,
                 }
+            elif self.adaptive_masking:
+                # Skip the random MLM masking entirely; emit the raw (unmasked) tokens together with
+                # a `maskable_mask` (everything that is not padding). The wrapper will run the
+                # scoring no-grad pass and replace `input_ids` / `labels` with on-line masking.
+                attention_mask_np = np.where(batch == self.pad_token_id, 0, 1)
+                maskable_mask_np = batch != self.pad_token_id
+                yieldval = {
+                    "input_ids": torch.from_numpy(batch),
+                    "labels": None,
+                    "cu_seqlens": cu_seq_lens,
+                    "max_seqlen": max_seq_lens,
+                    "attention_mask": torch.from_numpy(attention_mask_np),
+                    "maskable_mask": torch.from_numpy(maskable_mask_np),
+                }
+                self._token_count += yieldval["attention_mask"].sum().item()
             else:
                 (masked_batch, labels) = SequencePacker.mlm_masking(
                     batch, self.mask_prob, self.mask_token_id, self.pad_token_id, self.ignore_token_id, self.np_rng
@@ -395,6 +421,7 @@ class GreedyBestFitSequencePacker(SequencePacker):
         batch_size_warmup_min_size: Optional[int] = None,
         batch_size_warmup_tokens: Optional[Union[str, Time]] = None,
         world_size: int = 1,
+        adaptive_masking: bool = False,
     ) -> "GreedyBestFitSequencePacker":
         if batch_size_warmup_min_size is not None:
             if batch_size_warmup_min_size % micro_batch_size != 0:
@@ -420,6 +447,7 @@ class GreedyBestFitSequencePacker(SequencePacker):
             batch_size_warmup_min_size=batch_size_warmup_min_size,
             batch_size_warmup_tokens=batch_size_warmup_tokens,
             world_size=world_size,
+            adaptive_masking=adaptive_masking,
         )
 
     def _create_batch(self) -> Optional[tuple[np.ndarray, list[list[int]]]]:
@@ -537,9 +565,19 @@ def split_packed_batch(batch: Any, microbatch_size: Union[int, float], padding_t
 
     num_items = batch["input_ids"].shape[0]
     split_inputs = [x.squeeze() for x in batch["input_ids"].split(1)]
-    split_labels = [x.squeeze() for x in batch["labels"].split(1)]
+    # ``labels`` may be None when using adaptive masking (the model wrapper produces them on-line).
+    if batch.get("labels", None) is not None:
+        split_labels = [x.squeeze() for x in batch["labels"].split(1)]
+    else:
+        split_labels = [None for _ in range(num_items)]
     split_attention_masks = [x.squeeze() for x in batch["attention_mask"].split(1)]
     split_cu_seqlens = batch["cu_seqlens"]
+
+    # Optional adaptive-masking field. Carried through unchanged (per-microbatch slice).
+    if batch.get("maskable_mask", None) is not None:
+        split_maskable_mask = [x.squeeze() for x in batch["maskable_mask"].split(1)]
+    else:
+        split_maskable_mask = [None for _ in range(num_items)]
 
     result = []
     for i in range(num_items):
@@ -549,23 +587,28 @@ def split_packed_batch(batch: Any, microbatch_size: Union[int, float], padding_t
         if padding_amount > padding_tolerance:
             last_non_pad = attention_mask.nonzero().max()
             input_ids = split_inputs[i][: last_non_pad + 1]
-            labels = split_labels[i][: last_non_pad + 1]
+            labels = split_labels[i][: last_non_pad + 1] if split_labels[i] is not None else None
             cu_seqlens = split_cu_seqlens[i][:-1]
             attention_mask = attention_mask[: last_non_pad + 1]
+            maskable_mask = (
+                split_maskable_mask[i][: last_non_pad + 1] if split_maskable_mask[i] is not None else None
+            )
         else:
             input_ids = split_inputs[i]
             labels = split_labels[i]
             cu_seqlens = split_cu_seqlens[i]
+            maskable_mask = split_maskable_mask[i]
 
-        result.append(
-            {
-                "input_ids": input_ids,
-                "labels": labels,
-                "cu_seqlens": cu_seqlens,
-                "max_seqlen": batch["max_seqlen"][i],
-                "attention_mask": attention_mask,
-            }
-        )
+        item = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "cu_seqlens": cu_seqlens,
+            "max_seqlen": batch["max_seqlen"][i],
+            "attention_mask": attention_mask,
+        }
+        if maskable_mask is not None:
+            item["maskable_mask"] = maskable_mask
+        result.append(item)
 
     assert all([x["input_ids"].shape[-1] == y["cu_seqlens"][-1] for x, y in zip(result, result)])
     return result
