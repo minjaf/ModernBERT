@@ -83,19 +83,7 @@ model:
     sliding_window: 128
     global_attn_every_n_layers: 3
     unpad_embeddings: true
-    # NOTE: kept disabled for the adaptive-masking run. Online adaptive masking does an
-    # extra no-grad forward per microbatch on the *unmasked* input, then the standard
-    # training forward on the masked input. When `compile_model: true`, this combination
-    # (two forwards with different shapes + the no-grad/grad transition) interacts
-    # badly with DDP, leaving the per-layer attention weights (Wqkv, Wo) without
-    # gradients on rank 1 and triggering:
-    #   "Expected to have finished reduction in the prior iteration before starting a
-    #    new one. ... Parameter indices which did not receive grad for rank 1: 2 3 8 9 ..."
-    # The baseline config used `compile_model: true`; we lose ~10-20% throughput by
-    # turning it off here, but the run is correct. TODO: re-enable once we've isolated
-    # the torch.compile + DDP interaction (likely needs torch._dynamo.disable around
-    # the scoring forward, or invoking decoder/head/mlp in eager mode during scoring).
-    compile_model: false
+    compile_model: true
     masked_prediction: true
 
 # Dataloaders

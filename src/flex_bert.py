@@ -807,8 +807,32 @@ class EfficientHuggingFaceModel(HuggingFaceModel):
             out = HuggingFaceModel.forward(self, scoring_batch)
             logits = out.logits
         finally:
-            if was_training:
+            if was_training and self.adaptive_masker.cfg.use_eval_mode_for_scoring:
                 self.model.train()
+            # IMPORTANT: clear the autocast cache before the *training* forward.
+            #
+            # Under ``amp_bf16`` Composer wraps the whole microbatch in
+            # ``torch.autocast(...)``. By default autocast *caches* the cast
+            # of each fp32 ``nn.Linear`` / ``nn.Embedding`` weight to bf16
+            # so that repeated calls in the same context reuse the same
+            # bf16 tensor. The scoring forward above ran under
+            # ``torch.no_grad()``, which means the cached bf16 weights were
+            # created *without* an autograd link back to their fp32
+            # parameters. If we leave those cached casts in place, the
+            # subsequent training forward (with grad enabled) reuses them
+            # and the gradient never flows back to the fp32 weights -- DDP
+            # then fails with:
+            #   "Expected to have finished reduction in the prior iteration
+            #    before starting a new one. ... Parameter indices which did
+            #    not receive grad for rank 1: 2 3 5 6 8 9 ..."
+            # where the missing indices are exactly the ``nn.Linear``
+            # weights of every layer (norms are kept in fp32 by autocast
+            # and so do *not* go through this cache, which matches the
+            # observation that norm gradients are unaffected). Clearing
+            # the cache forces the training forward to recompute fresh
+            # bf16 casts that *are* tracked by autograd.
+            if torch.is_autocast_enabled():
+                torch.clear_autocast_cache()
 
         # Reshape ``logits`` to (B, S, V). The packed path returns 1D-flat logits whose first
         # dim equals B*S (since ``unpad_inputs`` is skipped when cu_seqlens is supplied).

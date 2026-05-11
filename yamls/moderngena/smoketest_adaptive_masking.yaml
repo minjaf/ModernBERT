@@ -72,7 +72,7 @@ model:
     sliding_window: 128
     global_attn_every_n_layers: 2
     unpad_embeddings: true
-    compile_model: false              # disable torch.compile for fast first-step
+    compile_model: true               # exercise the torch.compile path so we catch the bf16 autocast-cache bug
     masked_prediction: true
 
 train_loader:
