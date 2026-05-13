@@ -36,6 +36,10 @@ from omegaconf import DictConfig, OmegaConf
 from omegaconf import OmegaConf as om
 from torch.optim import AdamW
 
+from src._composer_patches import apply_composer_patches
+
+apply_composer_patches()
+
 import src.flex_bert as flex_bert_module
 import src.hf_bert as hf_bert_module
 import src.mosaic_bert as mosaic_bert_module
